@@ -37,7 +37,7 @@ test('torrent metadata and no-progress failures switch to the next eligible rele
   const sourceOverride=createHash('sha256').update(JSON.stringify([first.infoHash,first.fileIdx,first.url])).digest('hex');
   const d=Object.create(Downloader.prototype);const tried=[];d.streamsFor=async()=>[first,second];d.downloadTorrent=async(_job,choice)=>{tried.push(choice.title);if(choice.raw===first)throw Object.assign(new Error('source failed'),{code});return 'verified-file'};d.controllers=new Map();d.seasonHashes=new Map();d.save=()=>{};
   const job={id:'tt0000001:1:1',profile:{resolution:720,allowedResolutions:[720],english:false,downloadDir:directory},kind:'imdb',series:'tt0000001',seriesName:'Show',title:'Episode',season:1,episode:1,status:'queued',sourceOverride};
-  try{await d.run(job);assert.equal(job.status,'done');assert.deepEqual(tried,['Dead.S01E01.720p','Live.S01E01.720p']);}finally{fs.rmSync(directory,{recursive:true,force:true});}
+  try{await d.run(job);if(code==='NO_USEFUL_PIECES'){assert.equal(job.status,'retry_wait');assert.deepEqual(tried,['Dead.S01E01.720p']);}else{assert.equal(job.status,'done');assert.deepEqual(tried,['Dead.S01E01.720p','Live.S01E01.720p']);}}finally{fs.rmSync(directory,{recursive:true,force:true});}
  }
 });
 test('shutdown keeps interrupted active jobs queued for restart',async()=>{

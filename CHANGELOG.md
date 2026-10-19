@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.9
+
+- Try one extra episode after 30 seconds without useful data, without interrupting existing downloads.
+- Yield a still-stalled episode after 90 seconds and prefer untried sources on its next scheduled turn.
+- Add a right-hand series progress navigator, proportional queue segments, jump controls, and draggable scroll-position marker.
+- Display episode percentages and series progress across queued episodes, including partial progress.
+- Preserve scroll position across queue updates and keep manually paused entries paused.
+
 ## 0.4.8
 
 - Explicitly deselect whole-season torrents and download only active episode files, preserving shared boundary pieces.

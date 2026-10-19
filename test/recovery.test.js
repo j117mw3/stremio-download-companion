@@ -17,7 +17,7 @@ const job=(root,n)=>({id:'show:1:'+n,series:'show',seriesName:'Show',season:1,ep
 test('two exhausted jobs release both slots and later healthy episodes proceed',async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'recovery-'));const d=worker();let calls={};
  d.jobs=[1,2,3,4].map(n=>job(root,n));d.streamsFor=async()=>[1,2,3,4].map(source);
- d.downloadTorrent=async(j)=>{calls[j.id]=(calls[j.id]||0)+1;if(j.episode<=2)throw failure('NO_USEFUL_PIECES','stalled');return 'healthy';};
+ d.downloadTorrent=async(j)=>{calls[j.id]=(calls[j.id]||0)+1;if(j.episode<=2)throw failure('TORRENT_FAILURE','failed');return 'healthy';};
  try{d.pump();for(let i=0;i<40&&d.jobs.some(j=>['queued','downloading','resolving'].includes(j.status));i++)await new Promise(setImmediate);
  assert.deepEqual(d.jobs.map(j=>j.status),['retry_wait','retry_wait','done','done']);
  assert.equal(calls['show:1:1'],3);assert.equal(calls['show:1:2'],3);assert.equal(d.active,0);
@@ -51,6 +51,29 @@ test('speed is per-file and slow useful progress resets the stall timer',()=>{
  assert.deepEqual(a.sample(110,89000),{speed:10*1000/89000,idleMs:0});
  assert.equal(b.sample(0,89000).speed,0);assert.equal(b.sample(0,90000).idleMs,90000);
  assert.equal(a.sample(111,178000).idleMs,0);assert.equal(a.sample(111,179000).speed,0);
+});
+
+test('after 30 idle seconds one extra episode starts without interrupting stalled siblings',async()=>{
+ const d=worker();let now=29999;d.now=()=>now;
+ const original=[{id:'a',series:'show',season:1,status:'downloading',runStartedAt:0},{id:'b',series:'show',season:1,status:'downloading',runStartedAt:0}];
+ original.forEach(j=>d.controllers.set(j.id,new AbortController()));d.active=2;
+ d.jobs=[...original,{id:'paused',series:'show',season:1,status:'paused'},{id:'other',series:'other',season:1,status:'queued'},{id:'next',series:'show',season:1,status:'queued'},{id:'later',series:'show',season:1,status:'queued'}];
+ let finish;
+ d.run=j=>{j.status='downloading';j.runStartedAt=now;d.controllers.set(j.id,new AbortController());return new Promise(resolve=>{finish=()=>{j.status='done';d.controllers.delete(j.id);resolve();};});};
+ try{
+  d.pump();assert.equal(d.active,2);now=30000;d.pump();assert.equal(d.active,3);
+  assert.equal(d.jobs.find(j=>j.id==='next').isProbe,true);assert.equal(d.jobs.find(j=>j.id==='other').status,'queued');
+  now=60000;d.pump();assert.equal(d.active,3);assert.ok(original.every(j=>!d.controllers.get(j.id).signal.aborted));assert.equal(d.jobs.find(j=>j.id==='paused').status,'paused');
+ }finally{d.stopping=true;clearTimeout(d.retryTimer);finish?.();await Promise.all([...d.running]);}
+});
+
+test('a stalled episode yields immediately and prefers an untried source on its next turn',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'episode-switch-'));const d=worker();let now=1000;d.now=()=>now;
+ const sources=[source(1),source(2)];d.streamsFor=async()=>sources;const tried=[];
+ d.downloadTorrent=async(j,choice)=>{tried.push(choice.infoHash);if(choice.infoHash===sources[0].infoHash)throw failure('NO_USEFUL_PIECES','stalled');return 'verified';};
+ const j=job(root,1);
+ try{await d.run(j);assert.equal(j.status,'retry_wait');assert.equal(tried.length,1);now+=300001;await d.run(j);assert.equal(j.status,'done');assert.deepEqual(tried,sources.map(s=>s.infoHash));}
+ finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
 test('shared file references and overlapping boundary selections survive cancellation',()=>{

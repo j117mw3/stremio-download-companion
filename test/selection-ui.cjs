@@ -194,6 +194,28 @@ app.whenReady().then(async () => {
   ];
   await js('tick()');
   check(await js("document.getElementById('t').textContent.includes('Next retry:') && document.getElementById('t').textContent.includes('Waiting for useful pieces') && document.getElementById('t').textContent.includes('Shared torrent traffic: 1.0 MB/s') && document.getElementById('t').textContent.includes('Needs attention') && document.getElementById('t').textContent.includes('0.0 MB/s')"), 'queue distinguishes retry time, stalled episode speed, shared traffic, and Needs attention');
+  backend.downloader.jobs.push(
+    {id:'other:1:1',series:'other',seriesName:'Other Series',season:1,episode:1,status:'done',progress:1},
+    {id:'other:1:2',series:'other',seriesName:'Other Series',season:1,episode:2,status:'downloading',progress:.5,speed:1048576},
+    {id:'zeta:1:1',series:'zeta',seriesName:'Zeta <Series>',season:1,episode:1,status:'queued',progress:0}
+  );
+  await js('tick()');
+  check(await js("document.querySelectorAll('[data-series-jump]').length===3 && document.getElementById('seriesNavigator').textContent.includes('Other Series') && document.getElementById('seriesNavigator').textContent.includes('75%') && document.getElementById('seriesNavigator').textContent.includes('Zeta <Series>')"), 'series navigator groups shows and includes partial progress in the overall percentage');
+  check(await js("[...document.querySelectorAll('.progress-number')].map(e=>e.textContent).includes('50.0%') && [...document.querySelectorAll('.progress-number')].map(e=>e.textContent).includes('100%')"), 'episode progress bars display visible partial and completed percentages');
+  await js("document.querySelector('.queue-position').dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}))");
+  const drag=await js("(()=>{const m=document.querySelector('.queue-position').getBoundingClientRect(),t=document.getElementById('seriesTrack').getBoundingClientRect();return {x:Math.round(m.left+m.width/2),y:Math.round(m.top+4),end:Math.round(t.bottom-4),before:scrollY}})()");
+  window.webContents.sendInputEvent({type:'mouseDown',x:drag.x,y:drag.y,button:'left',clickCount:1});
+  window.webContents.sendInputEvent({type:'mouseMove',x:drag.x,y:drag.end});
+  window.webContents.sendInputEvent({type:'mouseUp',x:drag.x,y:drag.end,button:'left',clickCount:1});
+  await new Promise(resolve=>setTimeout(resolve,100));
+  check((await js('scrollY'))>drag.before, 'dragging the navigator marker scrolls the queue');
+  await js("document.querySelector('.queue-position').dispatchEvent(new KeyboardEvent('keydown',{key:'End',bubbles:true}))");
+  await new Promise(resolve => setTimeout(resolve, 100));
+  check(await js("document.querySelector('.queue-position').getAttribute('aria-valuenow')==='100' && document.querySelector('[data-series-jump=queue-series-2]').getAttribute('aria-current')==='location'"), 'navigator marker and current series follow the scroll position');
+  await js("document.querySelector('[data-series-jump=queue-series-0]').click()");
+  await waitFor(()=>js("document.getElementById('queue-series-0').getBoundingClientRect().top<100"),'Series jump timeout');
+  const beforeScroll=await js('scrollY');await js('tick()');
+  check(Math.abs((await js('scrollY'))-beforeScroll)<4, 'queue refresh preserves the current reading position');
   await new Promise(resolve => setTimeout(resolve, 100));
   fs.writeFileSync('test/selection-layout-final-wide.png', (await window.webContents.capturePage()).toPNG());
   await js("document.getElementById('t').scrollIntoView({block:'start'})");
