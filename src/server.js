@@ -9,6 +9,7 @@ import { Downloader } from './downloader.js';
 import { parseId, getEpisodes, getStreams, parseStream } from './resolver.js';
 
 const app = express();
+const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 const token = randomBytes(32).toString("hex");
 app.use(express.json({limit:"64kb"}));
 app.use((req,res,next)=>{if(req.method!=="GET" && (req.get("X-Companion-Token")!==token || (req.get("origin") && req.get("origin")!==`http://127.0.0.1:${cfg.port}`))) return res.sendStatus(403); next();});
@@ -26,7 +27,7 @@ app.use((req, res, next) => {
 app.get('/manifest.json', (req, res) =>
   res.json({
     id: 'local.season.downloader',
-    version: '0.4.4',
+    version,
     name: 'Season Downloader',
     description: 'Choose an episode, a whole season, or multiple seasons to download.',
     resources: ['stream'],
@@ -63,7 +64,7 @@ app.delete('/api/jobs/:id',(req,res)=>{try{if(!dl.remove(req.params.id))return r
 app.get('/api/search',async(req,res)=>{try{const q=String(req.query.q||'').trim();if(q.length<2||q.length>120)return res.status(400).json({error:'Enter a show name'});const response=await fetch('https://v3-cinemeta.strem.io/catalog/series/top/search='+encodeURIComponent(q)+'.json',{signal:AbortSignal.timeout(20000)});if(!response.ok)throw Error();const data=await response.json();res.json({results:(data.metas||[]).map(m=>({id:m.id,name:m.name,year:m.releaseInfo,poster:m.poster}))});}catch{res.status(502).json({error:'Search is unavailable. Please try again.'})}});
 app.post('/api/settings', (req,res)=>{const directory=req.body.downloadDir;if(typeof directory!=='string'||!path.isAbsolute(directory))return res.sendStatus(400);try{fs.mkdirSync(directory,{recursive:true});fs.accessSync(directory,fs.constants.W_OK);dl.store.write('preferences',{downloadDir:directory});cfg.downloadDir=directory;res.json({downloadDir:directory})}catch{res.status(400).json({error:'Folder is not writable'})}});
 app.get('/api/settings',(req,res)=>res.json({downloadDir:cfg.downloadDir}));
-app.get('/api/health',(req,res)=>res.json({app:'stremio-download-companion',version:'0.4.4',ready:true}));
+app.get('/api/health',(req,res)=>res.json({app:'stremio-download-companion',version,ready:true}));
 app.get('/api/jobs', (req, res) => res.json(dl.jobs.map(job=>({...job,canRemove:!dl.controllers.has(job.id)}))));
 
 app.get('/', (req, res) => res.set('Cache-Control','no-store').type('html').send(PAGE.replaceAll('__TOKEN__',token)));

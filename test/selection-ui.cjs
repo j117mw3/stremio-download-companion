@@ -72,6 +72,10 @@ app.whenReady().then(async () => {
   cfg.downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'selection-ui-'));
   const backend = await import('../src/server.js');
   await backend.ready;
+  const releaseVersion = require('../package.json').version;
+  const health = await (await fetch('http://127.0.0.1:7011/api/health')).json();
+  const manifest = await (await fetch('http://127.0.0.1:7011/manifest.json')).json();
+  check(health.version === releaseVersion && manifest.version === releaseVersion, 'backend health and Stremio manifest match the package version');
   let lastBatch = null;
   backend.downloader.enqueue = batch => {
     lastBatch = batch;
