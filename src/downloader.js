@@ -1,3 +1,4 @@
+import {failure, prepareTorrent, selectFile, FileProgress, RETRY_DELAYS, SOURCE_FAILURES} from './transfer-state.js';
 import {findExisting, verifyExisting, fingerprint} from './existing.js';
 import { finalize } from './finalize.js';
 import { ensureSpace } from './disk.js';
@@ -83,10 +84,13 @@ export class Downloader {
     this.torrents = new Map(); // infoHash -> { refs, promise, torrent, tmp }
     this.seasonHashes = new Map(); // series|season -> Set(infoHash) chosen so far
     this.saveTimer = null;
+    this.cooldowns={};
     this.load();
   }
 
   load() {
+    const cooldowns=this.store.read('sourceCooldowns');
+    this.cooldowns=cooldowns&&!Array.isArray(cooldowns)&&typeof cooldowns==='object'?cooldowns:{};
     this.jobs=this.store.read('jobs');
     if(this.jobs===null){
       this.jobs=[];
@@ -111,6 +115,7 @@ export class Downloader {
   saveNow() {
     fs.mkdirSync(cfg.downloadDir, { recursive: true });
     this.store.write('jobs',this.jobs);
+    this.store.write('sourceCooldowns',this.cooldowns||{});
   }
 
   async getClient() {
@@ -154,26 +159,54 @@ export class Downloader {
     return added;
   }
 
+  now() { return Date.now(); }
+
+  sourceKey(source) {
+    return createHash('sha256').update(JSON.stringify([source.infoHash,source.fileIdx,source.url,source.filename])).digest('hex');
+  }
+
+  available(job,source) {
+    const cooldowns=this.cooldowns||{};
+    return (cooldowns['torrent:'+source.infoHash]||0)<=this.now() &&
+      (cooldowns[job.id+'|'+this.sourceKey(source)]||0)<=this.now();
+  }
+
+  cool(job,source,error) {
+    this.cooldowns||={};
+    const key=error.code==='METADATA_TIMEOUT'?'torrent:'+source.infoHash:job.id+'|'+this.sourceKey(source);
+    this.cooldowns[key]=this.now()+5*60000;
+  }
+
+  defer(job,error) {
+    job.failureCode=error.code;job.error=error.message;job.speed=0;job.torrentSpeed=0;
+    const round=job.retryRound||0;
+    if(round>=RETRY_DELAYS.length){job.status='needs_attention';job.stage='Needs attention';job.nextRetryAt=null;}
+    else {job.status='retry_wait';job.stage='Retry scheduled';job.nextRetryAt=this.now()+RETRY_DELAYS[round];job.retryRound=round+1;}
+  }
+
   pump() {
-    while (!this.stopping && !this.clearing && this.active < cfg.concurrency) {
-      const job = this.jobs.find((j) => j.status === 'queued');
-      if (!job) return;
+    clearTimeout(this.retryTimer);
+    if(this.stopping||this.clearing)return;
+    const now=this.now();
+    for(const job of this.jobs)if(job.status==='retry_wait'&&job.nextRetryAt<=now){job.status='queued';job.nextRetryAt=null;}
+    while (this.active < cfg.concurrency) {
+      const job = this.jobs.find(j=>j.status==='queued'&&!this.controllers.has(j.id));
+      if (!job) break;
       this.active++;
       const task=this.run(job).finally(() => {
-        this.running.delete(task);
-        this.active--;
-        this.save();
-        this.pump();
+        this.running.delete(task);this.active--;this.save();this.pump();
       });
       this.running.add(task);
     }
+    const due=this.jobs.filter(j=>j.status==='retry_wait').map(j=>j.nextRetryAt);
+    if(due.length){this.retryTimer=setTimeout(()=>this.pump(),Math.max(1,Math.min(...due)-this.now()));this.retryTimer.unref?.();}
   }
 
   async run(job) {
     const controller = new AbortController(); this.controllers.set(job.id,controller);
     try {
       job.status = 'resolving';
-      job.error = null;
+      job.error = null;job.failureCode=null;job.speed=0;job.torrentSpeed=0;job.nextRetryAt=null;
       job.reused=false;job.replacement=null;
       const existingDir=path.join(job.profile?.downloadDir||cfg.downloadDir,safe(job.seriesName),`Season ${pad(job.season)}`);
       const existingPrefix=`${safe(job.seriesName)} - S${pad(job.season)}E${pad(job.episode)} - `;
@@ -192,7 +225,7 @@ export class Downloader {
           const checked=await (this.verifyExisting||verifyExisting)(existingFile,records[existingFile],controller.signal);
           records[existingFile]=checked;this.store?.write('verifiedFiles',records);
           job.file=existingFile;job.verification=checked.media;job.quality=checked.media.resolution+'p';
-          job.reused=true;job.stage='Already downloaded â€” verified';job.status='done';job.progress=1;job.peers=0;return;
+          job.reused=true;job.stage='Already downloaded — verified';job.status='done';job.progress=1;job.peers=0;return;
         }catch(e){
           if(e.code!=='CORRUPT_MEDIA')throw e;
           job.replacement={path:existingFile,...e.stamp};job.stage='Replacing damaged file';
@@ -204,13 +237,15 @@ export class Downloader {
       if (!this.seasonHashes.has(key)) this.seasonHashes.set(key, new Set());
       const hashes = this.seasonHashes.get(key);
 
-      const streams = await this.streamsFor(job.id,controller.signal);
+      let streams;
+      try{streams=await this.streamsFor(job.id,controller.signal);}catch(e){controller.signal.throwIfAborted();throw failure('PROVIDER_FAILURE',e.message);}
+      const originalCount=streams.length;
+      streams=streams.filter(raw=>this.available(job,parseStream(raw)));
       const choiceOptions = { mode, preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
       const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
       let choice = preferredSource ? pickBest([preferredSource], choiceOptions) : null;
       if (!choice) choice = pickBest(streams, choiceOptions);
-      if (!choice) throw new Error(mode === 'require' ? 'No English dub found' : 'No streams found');
-      if (choice.infoHash) hashes.add(choice.infoHash);
+      if (!choice) throw failure(originalCount&&!streams.length?'SOURCE_COOLDOWN':'NO_SOURCES',originalCount&&!streams.length?'Sources are cooling down':mode==='require'?'No English dub found':'No streams found');
 
       job.quality = choice.res ? `${choice.res}p` : '?';
       job.release = choice.title;
@@ -224,46 +259,52 @@ export class Downloader {
       const prefix = `S${pad(job.season)}E${pad(job.episode)} - `;
 
       job.attempts ||= [];
-      while(choice) {
-        let failure;
-        for(let attempt=0;attempt<3;attempt++) {
-          controller.signal.throwIfAborted();
-          try {
-            job.file = choice.url ? await this.downloadHttp(job,choice,dir,prefix) : await this.downloadTorrent(job,choice,dir,prefix);
-            failure=null;break;
-          } catch(e) { failure=e; if(controller.signal.aborted || e.code==='ENOSPC') throw e;
-            if(choice.url&&/HTTP (401|403|404|410)/.test(e.message)){const fresh=(await getStreams(job.id,{signal:controller.signal})).map(parseStream).find(candidate=>candidate.url&&candidate.filename&&candidate.filename===choice.filename&&candidate.res===choice.res);if(fresh){choice.url=fresh.url;choice.raw.behaviorHints=fresh.raw.behaviorHints;}}
-            job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:attempt+1,error:e.message,time:Date.now()});this.save();
-            // Retrying the same torrent cannot help when its swarm has no
-            // metadata/useful pieces, or when the selected file fails checks.
-            // Move on to another release after the first such failure.
-            if(/^(Timed out fetching torrent metadata|Stalled: no progress|Source must identify the episode file explicitly|Selected torrent file is not a video|Torrent file belongs to another episode|Actual video exceeds selected resolution|Actual resolution is outside the batch profile|Audio metadata shows no English track)/.test(e.message))break;
-            if(attempt<2) await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));
-          }
+      let candidates=0;
+      while(choice && candidates<3) {
+        candidates++;
+        controller.signal.throwIfAborted();
+        job.speed=0;job.torrentSpeed=0;job.progress=0;
+        job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';
+        try {
+          job.file=choice.url?await this.downloadHttp(job,choice,dir,prefix):await this.downloadTorrent(job,choice,dir,prefix);
+          if(choice.infoHash)hashes.add(choice.infoHash);
+          break;
+        }catch(e){
+          if(controller.signal.aborted||!SOURCE_FAILURES.has(e.code))throw e;
+          this.cool(job,choice,e);
+          job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:1,code:e.code,error:e.message,time:this.now()});
+          job.attempts=job.attempts.slice(-100);this.save();
+          streams=streams.filter(raw=>raw!==choice.raw&&this.available(job,parseStream(raw)));
+          const next=pickBest(streams,choiceOptions);
+          if(!next||candidates>=3)throw e;
+          choice=next;job.fallbackReason='Previous source failed';job.stage='Trying another source';
         }
-        if(!failure) break;
-        streams.splice(streams.indexOf(choice.raw),1);
-        choice=pickBest(streams,choiceOptions);
-        if(!choice) throw failure;
-        job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';job.fallbackReason='Previous source failed';job.stage='Switching to next source';this.save();
       }
       if(job.verification?.resolution)job.quality=job.verification.resolution+'p';
+      job.retryRound=0;job.failureCode=null;job.nextRetryAt=null;job.torrentSpeed=0;
       job.stage='Complete';
       job.status = 'done';
       job.progress = 1;
       job.speed = 0;
     } catch (e) {
-      if (!['paused','cancelled','queued'].includes(job.status)) job.status = e.code==='ENOSPC' ? 'paused' : 'failed';
+      if (!['paused','cancelled','queued'].includes(job.status)){
+        if(!controller.signal.aborted&&SOURCE_FAILURES.has(e.code))this.defer(job,e);
+        else {job.status=e.code==='ENOSPC'?'paused':'failed';job.failureCode=e.code||'LOCAL_FAILURE';}
+      }
       job.error = controller.signal.aborted ? null : e.message;
       job.speed = 0;
-    } finally {this.controllers.delete(job.id);}
+    } finally {job.speed=0;job.torrentSpeed=0;this.controllers.delete(job.id);}
+  }
+
+  async checkMedia(file,options) {
+    return (this.inspectMedia||inspectMedia)(file,options);
   }
 
   async finishFile(job,source,destination) {
     const signal=this.controllers.get(job.id)?.signal;
     if(job.replacement){
       job.stage='Verifying replacement';
-      const checked=await (this.verifyExisting||verifyExisting)(source,null,signal);
+      let checked;try{checked=await (this.verifyExisting||verifyExisting)(source,null,signal);}catch(e){if(e.code==='CORRUPT_MEDIA')throw failure('SOURCE_MEDIA','Replacement video failed verification');throw e;}
       const current=await fingerprint(job.replacement.path,signal);
       if(current.hash!==job.replacement.hash)throw new Error('Existing file changed; retry verification');
       signal?.throwIfAborted();
@@ -289,41 +330,39 @@ export class Downloader {
       /* fresh download */
     }
     if(!meta.validator) start=0;
-    const idle=new AbortController();let idleTimer;const resetIdle=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>idle.abort(new Error('HTTP transfer stalled')),cfg.stallMinutes*60000);idleTimer.unref();};resetIdle();
+    const idle=new AbortController();let idleTimer;const resetIdle=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>idle.abort(failure('HTTP_STALL','HTTP transfer stalled')),90000);idleTimer.unref();};resetIdle();
     const signal=AbortSignal.any([this.controllers.get(job.id).signal,idle.signal]);
     job.stage='Downloading video';
-    const res = await fetch(c.url, {signal, headers:{...c.raw.behaviorHints?.proxyHeaders?.request,...(start?{Range:'bytes='+start+'-','If-Range':meta.validator}:{})},redirect:'follow'});
-    if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
+    let speedTimer;
+    try {
+    let res;try{res = await fetch(c.url, {signal, headers:{...c.raw.behaviorHints?.proxyHeaders?.request,...(start?{Range:'bytes='+start+'-','If-Range':meta.validator}:{})},redirect:'follow'});}catch(e){this.controllers.get(job.id)?.signal.throwIfAborted();if(idle.signal.aborted)throw idle.signal.reason;throw failure('HTTP_FAILURE','HTTP connection failed');}
+    if (!res.ok && res.status !== 206){await res.body?.cancel();throw failure('HTTP_FAILURE',`HTTP ${res.status}`,{status:res.status});}
     const resumed = res.status === 206;
-    if(resumed && (!start || !res.headers.get("content-range")?.startsWith(`bytes ${start}-`))) {await res.body.cancel();throw new Error("Invalid resume response");}
+    if(resumed && (!start || !res.headers.get("content-range")?.startsWith(`bytes ${start}-`))) {await res.body.cancel();throw failure('HTTP_RESUME','Invalid resume response');}
     fs.writeFileSync(metaPath,JSON.stringify({validator:res.headers.get("etag")||res.headers.get("last-modified")}));
     if (!resumed) start = 0;
     const total = start + Number(res.headers.get('content-length') || 0);
     job.totalBytes=total;
     try{ensureSpace(dir,Math.max(0,total-start)+total)}catch(e){await res.body.cancel();throw e;}
     let got = start;
-    let tick = Date.now();
-    let tickBytes = got;
+    const meter=new FileProgress(got,this.now());
+    speedTimer=setInterval(()=>{job.speed=meter.sample(got,this.now()).speed;},1000);
     const body = Readable.fromWeb(res.body);
     body.on('data', (chunk) => {
       resetIdle();
       got += chunk.length;
       if (total) job.progress = got / total;
-      const now = Date.now();
-      if (now - tick >= 1000) {
-        job.speed = ((got - tickBytes) * 1000) / (now - tick);
-        tick = now;
-        tickBytes = got;
-      }
+
     });
-    try{await pipeline(body, fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' }));}finally{clearTimeout(idleTimer);}
-    if(total && got!==total) throw new Error("Incomplete response");
+    try{await pipeline(body, fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' }),{signal});}catch(e){this.controllers.get(job.id)?.signal.throwIfAborted();if(idle.signal.aborted)throw idle.signal.reason;if(['ECONNRESET','ETIMEDOUT','ERR_STREAM_PREMATURE_CLOSE'].includes(e.code))throw failure('HTTP_FAILURE','HTTP connection interrupted');throw e;}finally{clearTimeout(idleTimer);}
+    if(total && got!==total) throw failure('HTTP_INCOMPLETE','Incomplete response');
     job.stage='Checking video and audio';
-    job.verification=await (this.inspectMedia || inspectMedia)(part,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions});
+    job.verification=await this.checkMedia(part,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions,signal:this.controllers.get(job.id)?.signal});
     this.controllers.get(job.id)?.signal.throwIfAborted();
     await this.finishFile(job,part,dest);
     fs.unlinkSync(part);fs.unlinkSync(metaPath);
     return dest;
+    }finally{clearTimeout(idleTimer);clearInterval(speedTimer);job.speed=0;}
   }
 
   // ---- torrents: only the wanted file is downloaded, even from a season pack ----
@@ -345,17 +384,21 @@ export class Downloader {
       const magnet = `magnet:?xt=urn:btih:${c.infoHash}` + trackers.map((t) => `&tr=${encodeURIComponent(t)}`).join('');
       const cached=readCachedTorrent(e.metainfo,c.infoHash);
       e.promise = new Promise((resolve, reject) => {
-        this.getClient().then(client=>{const t = client.add(cached||magnet, { path: e.tmp, deselect: true });
+        this.getClient().then(client=>{
+        if(this.torrents.get(c.infoHash)!==e)throw failure('STOPPED','Stopped');
+        const t = client.add(cached||magnet, { path: e.tmp });
         e.torrent = t;
-        const timer = setTimeout(() => reject(new Error('Timed out fetching torrent metadata from peers')), cfg.metadataTimeoutSeconds * 1000);
+        const timer = setTimeout(() => reject(failure('METADATA_TIMEOUT','Timed out fetching torrent metadata from peers')), cfg.metadataTimeoutSeconds * 1000);
+        e.cleanup=()=>clearTimeout(timer);
         t.on('metadata',()=>cacheTorrent(e.metainfo,t));
         t.on('error', (err) => {
           clearTimeout(timer);
-          reject(err);
+          reject(failure('TORRENT_FAILURE',err.message));
         });
         t.on('ready', () => {
           clearTimeout(timer);
           cacheTorrent(e.metainfo,t);
+          prepareTorrent(e);
           resolve(e);
         });
         }).catch(reject);
@@ -379,6 +422,7 @@ export class Downloader {
     e.refs--;
     if (e.refs > 0) return;
     this.torrents.delete(infoHash);
+    e.cleanup?.();
     try {
       e.torrent?.destroy();
     } catch {
@@ -388,7 +432,7 @@ export class Downloader {
   }
 
   async downloadTorrent(job, c, dir, prefix) {
-    job.stage='Finding torrent metadata';
+    job.speed=0;job.torrentSpeed=0;job.stage='Finding torrent metadata';
     job.peers=0;
     const peerMonitor=setInterval(()=>{job.peers=this.torrents.get(c.infoHash)?.torrent?.numPeers||0;},1000);
     let e;
@@ -396,44 +440,44 @@ export class Downloader {
     finally { clearInterval(peerMonitor); }
     job.peers=e.torrent?.numPeers||0;
     job.stage='Downloading video';
+    let unselect;
     try {
       const t = e.torrent;
       const file=torrentEpisodeFile(t,c,job);
-      if (!file) throw new Error('Source must identify the episode file explicitly or by a matching filename');
-      if(!VIDEO_EXT.test(file.path))throw new Error("Selected torrent file is not a video");
-      const episodeTag=/s(\d+)[ ._-]*e(\d+)/i.exec(path.basename(file.path));if(episodeTag&&(Number(episodeTag[1])!==job.season||Number(episodeTag[2])!==job.episode))throw new Error("Torrent file belongs to another episode");
+      if (!file) throw failure('SOURCE_FILE','Source must identify the episode file explicitly or by a matching filename');
+      if(!VIDEO_EXT.test(file.path))throw failure('SOURCE_FILE','Selected torrent file is not a video');
+      const episodeTag=/s(\d+)[ ._-]*e(\d+)/i.exec(path.basename(file.path));if(episodeTag&&(Number(episodeTag[1])!==job.season||Number(episodeTag[2])!==job.episode))throw failure('SOURCE_FILE','Torrent file belongs to another episode');
       job.totalBytes=file.length;
       ensureSpace(dir,Math.max(0,file.length-file.downloaded)+file.length);
-      file.select();
-
-      await new Promise((resolve, reject) => {
-        let last = -1;
-        let lastChange = Date.now();
-        const iv = setInterval(() => {
-          if(this.controllers.get(job.id)?.signal.aborted){clearInterval(iv);reject(new Error("Stopped"));return;}
-          job.progress = file.progress;
-          job.speed = t.downloadSpeed;
-          job.peers = t.numPeers;
-          if (file.progress >= 1) {
-            clearInterval(iv);
-            resolve();
-          } else if (file.downloaded !== last) {
-            last = file.downloaded;
-            lastChange = Date.now();
-          } else if (Date.now() - lastChange > cfg.stallMinutes * 60000) {
-            clearInterval(iv);
-            reject(new Error('Stalled: connected peers sent no usable pieces'));
-          }
-        }, 1000);
+      unselect=selectFile(e,file);
+      await new Promise((resolve,reject)=>{
+        const signal=this.controllers.get(job.id)?.signal;
+        const progress=new FileProgress(file.downloaded,this.now());
+        let iv;
+        const finish=error=>{clearInterval(iv);signal?.removeEventListener('abort',abort);t.removeListener('error',onError);error?reject(error):resolve();};
+        const abort=()=>finish(new Error('Stopped'));
+        const onError=error=>finish(failure('TORRENT_FAILURE',error.message));
+        const poll=()=>{
+          if(signal?.aborted)return abort();
+          const sample=progress.sample(file.downloaded,this.now());
+          job.progress=file.progress;job.speed=sample.speed;job.torrentSpeed=t.downloadSpeed;job.peers=t.numPeers;
+          job.stage=sample.idleMs>=1000?'Waiting for useful pieces':'Downloading video';
+          if(file.progress>=1)return finish();
+          if(sample.idleMs>=90000)finish(failure('NO_USEFUL_PIECES','Stalled: connected peers sent no usable pieces'));
+        };
+        t.on('error',onError);signal?.addEventListener('abort',abort,{once:true});
+        iv=setInterval(poll,1000);poll();
       });
 
       const src = path.join(t.path, file.path);
       const dest = path.join(dir, safe(job.seriesName)+' - '+prefix+safe(job.title||'Episode')+path.extname(file.path));
-      job.verification=await (this.inspectMedia || inspectMedia)(src,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions});
+      job.verification=await this.checkMedia(src,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions,signal:this.controllers.get(job.id)?.signal});
       this.controllers.get(job.id)?.signal.throwIfAborted();
       await this.finishFile(job,src,dest);
       return dest;
     } finally {
+      unselect?.();
+      job.speed=0;job.torrentSpeed=0;
       this.release(c.infoHash);
     }
   }
@@ -441,8 +485,8 @@ export class Downloader {
   control(id, action) {
     if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
     const job=this.jobs.find(j=>j.id===id);if(!job) throw new Error("Unknown job");
-    if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";this.controllers.get(id)?.abort();}
-    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done")job.status="queued";}
+    if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";job.nextRetryAt=null;job.speed=0;job.torrentSpeed=0;this.controllers.get(id)?.abort();}
+    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done"){job.status="queued";job.retryRound=0;job.nextRetryAt=null;job.failureCode=null;for(const key of Object.keys(this.cooldowns||{}))if(key.startsWith(job.id+'|'))delete this.cooldowns[key];}}
     else throw new Error("Unknown action");
     this.save();this.pump();
   }
@@ -460,7 +504,7 @@ export class Downloader {
 
   async clearAll() {
     if (this.clearing) throw new Error('The queue is already being cleared');
-    this.clearing = true;
+    this.clearing = true;clearTimeout(this.retryTimer);
     const removed = this.jobs.length;
     for (const job of this.jobs) {
       job.status = 'cancelled';
@@ -480,7 +524,7 @@ export class Downloader {
   }
 
   async shutdown() {
-    this.stopping=true;
+    this.stopping=true;clearTimeout(this.retryTimer);
     for(const [id,c] of this.controllers){
       const job=this.jobs.find(item=>item.id===id);
       if(job&&['resolving','downloading','verifying'].includes(job.status)){

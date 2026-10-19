@@ -187,12 +187,26 @@ app.whenReady().then(async () => {
   check(JSON.parse(wideState).mode === 'true' && JSON.parse(wideState).quality === '1080' && !JSON.parse(wideState).disabled, 'normal-width capture uses a settled Series selection');
   check(metadataRequests === 4, 'selection previews reuse server-fetched show metadata');
 
+  backend.downloader.jobs = [
+    {id:'fixture:1:1',seriesName:'Fixture Show',season:1,episode:1,status:'retry_wait',stage:'Retry scheduled',nextRetryAt:Date.now()+300000,speed:0,progress:.2},
+    {id:'fixture:1:2',seriesName:'Fixture Show',season:1,episode:2,status:'downloading',stage:'Waiting for useful pieces',speed:0,torrentSpeed:1048576,peers:4,progress:.1},
+    {id:'fixture:1:3',seriesName:'Fixture Show',season:1,episode:3,status:'needs_attention',stage:'Needs attention',speed:0,progress:0}
+  ];
+  await js('tick()');
+  check(await js("document.getElementById('t').textContent.includes('Next retry:') && document.getElementById('t').textContent.includes('Waiting for useful pieces') && document.getElementById('t').textContent.includes('Shared torrent traffic: 1.0 MB/s') && document.getElementById('t').textContent.includes('Needs attention') && document.getElementById('t').textContent.includes('0.0 MB/s')"), 'queue distinguishes retry time, stalled episode speed, shared traffic, and Needs attention');
   await new Promise(resolve => setTimeout(resolve, 100));
   fs.writeFileSync('test/selection-layout-final-wide.png', (await window.webContents.capturePage()).toPNG());
+  await js("document.getElementById('t').scrollIntoView({block:'start'})");
+  await new Promise(resolve => setTimeout(resolve, 100));
+  fs.writeFileSync('test/recovery-queue-wide.png', (await window.webContents.capturePage()).toPNG());
   window.setSize(520, 900);
   await new Promise(resolve => setTimeout(resolve, 100));
   check(await js('document.documentElement.scrollWidth<=innerWidth'), 'narrow desktop layout has no horizontal overflow');
   fs.writeFileSync('test/selection-layout-final-narrow.png', (await window.webContents.capturePage()).toPNG());
+  await js("document.getElementById('t').scrollIntoView({block:'start'})");
+  await new Promise(resolve => setTimeout(resolve, 100));
+  check(await js("document.getElementById('t').scrollWidth<=document.getElementById('t').clientWidth"), 'narrow queue shows recovery information without horizontal scrolling');
+  fs.writeFileSync('test/recovery-queue-narrow.png', (await window.webContents.capturePage()).toPNG());
   console.log('Selection UI checks complete');
   app.exit(0);
 }).catch(error => {

@@ -4,7 +4,7 @@ A Windows desktop companion for downloading an episode, a season, or selected se
 
 ## Install
 
-1. Download **Stremio Download Companion Setup 0.4.7.exe** from [the latest release](https://github.com/j117mw3/stremio-download-companion/releases/latest).
+1. Download **Stremio Download Companion Setup 0.4.8.exe** from [the latest release](https://github.com/j117mw3/stremio-download-companion/releases/latest).
 2. Quit an older companion using its tray menu, then run the installer. Existing downloads and queue data are retained.
 3. Open the companion, choose your download folder, and connect Stremio using **Install addon**. If needed, paste `http://127.0.0.1:7000/manifest.json` into Stremio's Addons page.
 
@@ -23,6 +23,8 @@ Future episodes are excluded. Select quality, allowed lower-quality fallbacks, a
 ## Queue and existing files
 
 Pause, resume, cancel, retry, choose sources, remove stopped entries, or remove all queue entries. Removing entries does not delete downloaded media. Partial downloads are retained for recovery.
+
+Only active episode files are selected in a season torrent. Episode speed measures that file's progress; shared torrent traffic is shown separately. After 90 seconds without useful episode bytes, the companion tries another eligible source. Each scheduling turn tries at most three sources, then releases the slot so later episodes can continue. Retry times are 5, 15, and 60 minutes; after three automatic retries the entry shows **Needs attention**. Manual retry starts a new retry cycle. Scheduled retries survive restarts and paused entries stay paused.
 
 Before requesting sources, the companion checks the saved episode path and its show/season folder. Healthy episodes are reused regardless of the newly selected quality. The first check reads the file and performs a full FFmpeg decode; subsequent checks compare its SHA-256 with a stored verification. The queue shows **Checking existing file**, then **Already downloaded — verified**. Checks can be cancelled.
 
@@ -60,4 +62,4 @@ For local development overrides, copy `config.example.json` to `config.json`. Th
 
 [Changelog](CHANGELOG.md) · [MIT license](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md)
 
-v0.4.7 is the first public release. Earlier local development builds are summarized in the changelog and are not published as historical releases.
+v0.4.8 fixes stalled queue recovery and season-pack bandwidth selection. v0.4.7 was the first public release. Earlier local development builds are summarized in the changelog and are not published as historical releases.

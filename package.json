@@ -1,9 +1,12 @@
 {
   "name": "stremio-season-downloader",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "author": "j117mw3",
   "license": "MIT",
-  "repository": {"type": "git", "url": "https://github.com/j117mw3/stremio-download-companion.git"},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/j117mw3/stremio-download-companion.git"
+  },
   "homepage": "https://github.com/j117mw3/stremio-download-companion",
   "scripts": {
     "start": "node src/server.js",
@@ -13,7 +16,10 @@
     "test:torrent": "node test/torrent-smoke.js",
     "dist": "electron-builder --win nsis --x64"
   },
-  "devDependencies": {"electron": "44.9.0", "electron-builder": "26.15.3"},
+  "devDependencies": {
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3"
+  },
   "description": "Stremio addon and local downloader for episodes, seasons, and series.",
   "type": "module",
   "main": "desktop.cjs",

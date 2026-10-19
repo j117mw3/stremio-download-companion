@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.8
+
+- Explicitly deselect whole-season torrents and download only active episode files, preserving shared boundary pieces.
+- Release file selections after cancellation, failure, or completion without interrupting sibling downloads.
+- Display per-episode speed separately from shared torrent traffic.
+- Switch sources after a metadata timeout or 90 seconds without useful episode progress; preserve slow but progressing transfers.
+- Limit each queue turn to three candidates; defer unsuccessful jobs so other episodes continue.
+- Persist cooldowns and automatic retries after 5, 15, and 60 minutes, then show Needs attention.
+- Use typed transfer and media failures rather than matching error wording.
+
 ## 0.4.7 — First public release
 
 - Reuse healthy existing episode files regardless of selected quality.
