@@ -110,6 +110,15 @@ test('candidate total deadline is 30 seconds even after metadata becomes ready',
  finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
+test('100 percent received torrent blocks cannot finalize until every episode piece is hash-verified',async t=>{
+ t.mock.timers.enable({apis:['setInterval']});const root=fs.mkdtempSync(path.join(os.tmpdir(),'verified-completion-'));const d=worker();let verified=false,finalized=false;
+ const file={path:'Show.S01E01.mkv',offset:0,length:2048,downloaded:2048,progress:1};
+ const torrent=Object.assign(new EventEmitter(),{path:root,files:[file],pieces:[{},{}],pieceLength:1024,bitfield:{get:()=>verified},select(){},deselect(){}});
+ d.acquire=async()=>({torrent});d.release=()=>{};d.checkMedia=async()=>({resolution:480});d.finishFile=async()=>{finalized=true;};
+ try{const a=d.startAttempt({id:'a',seriesName:'Show',season:1,episode:1},{infoHash:'a',fileIdx:0},false,new AbortController().signal,root,'S01E01 - ');await new Promise(setImmediate);t.mock.timers.tick(1000);assert.equal(finalized,false);assert.equal(a.evidence.complete,false);verified=true;t.mock.timers.tick(1000);await a.promise;assert.equal(finalized,true);assert.equal(a.evidence.complete,true);}
+ finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
 test('real HTTP comparison replaces a stalled near-complete release while preserving its partial', {timeout:10000},async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'http-comparison-'));let stalledClosed=false,liveRequests=0;
  const server=http.createServer((req,res)=>{

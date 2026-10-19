@@ -178,6 +178,7 @@ export class Downloader {
   connectivityScore(job,source) {
     const results=this.sourceResults||{},now=this.now(),exact=results[this.sourceKey(source)];
     if(exact?.expires>now&&exact.status==='working')return exact.speed||0;
+    if(exact?.expires>now&&exact.status==='failed')return -1;
     const swarmKey=createHash('sha256').update(String(source.infoHash||source.url)).digest('hex');
     const seriesKey=createHash('sha256').update(String(job.series)).digest('hex');
     const positive=Object.values(results).filter(r=>r.expires>now&&r.status==='working'&&r.swarmKey===swarmKey&&r.seriesKey===seriesKey);
@@ -574,14 +575,15 @@ export class Downloader {
           if(signal?.aborted)return abort();
           if(t.destroyed)return finish(failure('TORRENT_FAILURE','Torrent connection closed'));
           const sample=progress.sample(file.downloaded,this.now());
-          context?.observe(file.downloaded,verifiedFileBytes(t,file),file.progress>=1);
+          const verified=verifiedFileBytes(t,file);
+          context?.observe(file.downloaded,verified,verified>=file.length);
           if(context?.adopted&&windowSelection){windowSelection.release();windowSelection=null;unselect=selectFile(e,file);}
           else if(context?.capped)windowSelection?.release();else windowSelection?.advance();
           job.progress=file.progress;job.speed=sample.speed;job.torrentSpeed=t.downloadSpeed;job.peers=t.numPeers;
           job.downloadedBytes=file.downloaded;job.idleSeconds=Math.floor(sample.idleMs/1000);
           if(sample.speed>0)job.lastProgressAt=this.now();
           job.stage=sample.idleMs>=1000?'Waiting for useful pieces':'Downloading video';
-          if(file.progress>=1)return finish();
+          if(file.progress>=1&&(!t.bitfield||verified>=file.length))return finish();
           if(sample.idleMs>=90000)finish(failure('NO_USEFUL_PIECES','Stalled: connected peers sent no usable pieces'));
         };
         t.on('error',onError);signal?.addEventListener('abort',abort,{once:true});
