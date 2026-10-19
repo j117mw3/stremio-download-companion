@@ -1,0 +1,52 @@
+{
+  "name": "stremio-season-downloader",
+  "version": "0.4.7",
+  "author": "j117mw3",
+  "license": "MIT",
+  "repository": {"type": "git", "url": "https://github.com/j117mw3/stremio-download-companion.git"},
+  "homepage": "https://github.com/j117mw3/stremio-download-companion",
+  "scripts": {
+    "start": "node src/server.js",
+    "desktop": "electron .",
+    "test": "node --test test/*.test.js",
+    "test:ui": "electron test/selection-ui.cjs",
+    "test:torrent": "node test/torrent-smoke.js",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {"electron": "44.9.0", "electron-builder": "26.15.3"},
+  "description": "Stremio addon and local downloader for episodes, seasons, and series.",
+  "type": "module",
+  "main": "desktop.cjs",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "build": {
+    "appId": "com.electron.stremio-season-downloader",
+    "productName": "Stremio Download Companion",
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "desktop.cjs",
+      "src/**/*",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "package.json",
+      "preload.cjs"
+    ],
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "runAfterFinish": false,
+      "artifactName": "Stremio Download Companion Setup ${version}.${ext}"
+    }
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "parse-torrent": "9.1.5",
+    "snappyjs": "^0.7.0",
+    "webtorrent": "1.9.7"
+  }
+}

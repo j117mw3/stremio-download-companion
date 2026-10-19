@@ -1,0 +1,9 @@
+import {execFile} from 'node:child_process';import {promisify} from 'node:util';import path from 'node:path';import fs from 'node:fs';
+const run=promisify(execFile);
+export async function inspectMedia(file, {english=false,maxResolution=0,allowedResolutions,signal}={}){
+const candidates=[process.env.COMPANION_FFPROBE,process.resourcesPath&&path.join(process.resourcesPath,'ffprobe.exe'),path.join(process.env.LOCALAPPDATA||'','Programs/Stremio/ffprobe.exe')].filter(Boolean);
+const exe=candidates.find(p=>fs.existsSync(p));if(!exe)throw new Error('Media inspection utility is unavailable');
+const {stdout}=await run(exe,['-v','error','-show_streams','-show_format','-of','json',file],{signal,timeout:60000,maxBuffer:4*1024*1024,windowsHide:true});const info=JSON.parse(stdout);const video=info.streams?.find(s=>s.codec_type==='video');if(!video||!Number(video.height))throw new Error('Downloaded file has no valid video');
+if(maxResolution&&video.height>maxResolution)throw new Error('Actual video exceeds selected resolution');const resolution=video.width>=3800||video.height>1440?2160:video.width>=2500||video.height>1080?1440:video.width>=1900||video.height>720?1080:video.width>=1200||video.height>480?720:480;if(allowedResolutions&&!allowedResolutions.includes(resolution))throw new Error('Actual resolution is outside the batch profile');const audio=info.streams.filter(s=>s.codec_type==='audio');const eng=audio.some(s=>/^(eng|en)$/i.test(s.tags?.language||''));const tagged=audio.filter(s=>s.tags?.language&&!/^(und|unknown)$/i.test(s.tags.language));if(english&&!eng&&tagged.length===audio.length)throw new Error('Audio metadata shows no English track');return {resolution,width:video.width,height:video.height,codec:video.codec_name,audio:eng?'English verified':english?'English audio not tagged':'Original audio',duration:Number(info.format?.duration)||null};
+}
+

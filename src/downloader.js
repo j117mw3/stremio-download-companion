@@ -1,0 +1,497 @@
+import {findExisting, verifyExisting, fingerprint} from './existing.js';
+import { finalize } from './finalize.js';
+import { ensureSpace } from './disk.js';
+import { inspectMedia } from './media.js';
+import { Store } from './store.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createHash } from 'node:crypto';
+import parseTorrent from 'parse-torrent';
+import { cfg } from './config.js';
+import { getStreams, pickBest, effectiveDubMode, parseStream } from './resolver.js';
+
+const pad = (n) => String(n).padStart(2, '0');
+const safe = (s) => String(s).replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim() || 'untitled';
+const VIDEO_EXT = /\.(mkv|mp4|avi|webm|mov|m4v|ts)$/i;
+
+function readCachedTorrent(file, expectedHash) {
+  try {
+    const bytes=fs.readFileSync(file);
+    const parsed=parseTorrent(bytes);
+    if(parsed.infoHash?.toLowerCase()===expectedHash.toLowerCase()) return bytes;
+  } catch {}
+  try { fs.unlinkSync(file); } catch {}
+  return null;
+}
+
+function cacheTorrent(file, torrent) {
+  const bytes=torrent?.torrentFile;
+  if(!Buffer.isBuffer(bytes)||!bytes.length||fs.existsSync(file)) return;
+  const temp=`${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file),{recursive:true});
+    fs.writeFileSync(temp,bytes,{flag:'wx'});
+    try { fs.renameSync(temp,file); }
+    catch(error) {
+      try { fs.unlinkSync(temp); } catch {}
+      if(!fs.existsSync(file)) throw error;
+    }
+  } catch {
+    try { fs.unlinkSync(temp); } catch {}
+  }
+}
+
+function namesEpisode(text, job) {
+  const value=String(text||'');
+  let m=/(?:^|[^a-z0-9])s0*(\d{1,2})[ ._-]*e0*(\d{1,3})(?:[^0-9]|$)/i.exec(value);
+  if(m)return Number(m[1])===job.season&&Number(m[2])===job.episode;
+  m=/(?:^|\D)(\d{1,2})\s*[xÃƒâ€”]\s*(\d{1,3})(?:\D|$)/i.exec(value);
+  if(m)return Number(m[1])===job.season&&Number(m[2])===job.episode;
+  m=/season\s*0*(\d+).*?episode\s*0*(\d+)/i.exec(value);
+  return !!m&&Number(m[1])===job.season&&Number(m[2])===job.episode;
+}
+
+function torrentEpisodeFile(torrent, choice, job) {
+  if(Number.isInteger(choice.fileIdx))return torrent.files[choice.fileIdx]||null;
+  const videos=torrent.files.filter(file=>VIDEO_EXT.test(file.path));
+  if(choice.filename){
+    const target=path.basename(choice.filename).toLowerCase();
+    const exact=videos.filter(file=>path.basename(file.path).toLowerCase()===target);
+    if(exact.length===1)return exact[0];
+  }
+  const tagged=videos.filter(file=>namesEpisode(file.path,job));
+  if(tagged.length===1)return tagged[0];
+  // Some Stremio add-ons return a single-episode torrent without fileIdx. Only
+  // infer its sole video file when the provider's own label names this episode.
+  if(videos.length===1&&namesEpisode(choice.title+' '+(choice.filename||''),job))return videos[0];
+  return null;
+}
+
+export class Downloader {
+  constructor() {
+    this.stateFile = path.join(cfg.downloadDir, 'jobs.json');
+    this.store = new Store(cfg.downloadDir);
+    this.jobs = [];
+    this.active = 0;
+    this.running = new Set();
+    this.controllers = new Map();
+    this.stopping = false;
+    this.clearing = false;
+    this.client = null;
+    this.torrents = new Map(); // infoHash -> { refs, promise, torrent, tmp }
+    this.seasonHashes = new Map(); // series|season -> Set(infoHash) chosen so far
+    this.saveTimer = null;
+    this.load();
+  }
+
+  load() {
+    this.jobs=this.store.read('jobs');
+    if(this.jobs===null){
+      this.jobs=[];
+      if(fs.existsSync(this.stateFile)){
+        const legacy=JSON.parse(fs.readFileSync(this.stateFile,'utf8'));
+        if(!Array.isArray(legacy))throw new Error('Legacy queue is not a valid job list');
+        if(!fs.existsSync(this.stateFile+'.migration-backup'))fs.copyFileSync(this.stateFile,this.stateFile+'.migration-backup',fs.constants.COPYFILE_EXCL);
+        this.jobs=legacy;for(const job of this.jobs)if(job.status==='done'){job.status='paused';job.error='Legacy completed file requires verification';}
+      }
+      this.store.write('jobs',this.jobs);
+    }
+    if(!Array.isArray(this.jobs))throw new Error('Saved queue is invalid; original database preserved');
+    for(const job of this.jobs)if(['downloading','resolving','verifying'].includes(job.status))job.status='queued';
+    this.pump();
+  }
+
+  save() {
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => this.saveNow(), 500);
+  }
+
+  saveNow() {
+    fs.mkdirSync(cfg.downloadDir, { recursive: true });
+    this.store.write('jobs',this.jobs);
+  }
+
+  async getClient() {
+    if (!this.client) { const {default:WebTorrent}=await import("webtorrent"); this.client = new WebTorrent(); }
+    return this.client;
+  }
+
+  async streamsFor(id, signal) {
+    return getStreams(id,{signal});
+  }
+
+  /** Queue episodes. Active entries are retained; completed files are rechecked before reuse. */
+  enqueue({ kind, series, seriesName, episodes, profile = {} }) {
+    if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
+    let added = 0;
+    for (const ep of episodes) {
+      const existing = this.jobs.find((j) => j.id === ep.id);
+      if (existing && !['failed','done'].includes(existing.status)) continue;
+      if (existing) this.jobs.splice(this.jobs.indexOf(existing), 1);
+      this.jobs.push({
+        id: ep.id,
+        profile: {...profile,downloadDir:cfg.downloadDir},
+        title: ep.title,
+        kind,
+        series,
+        seriesName,
+        season: ep.season,
+        episode: ep.episode,
+        status: 'queued',
+        progress: 0,
+        speed: 0,
+        quality: null,
+        release: null,
+        error: null,
+        file: existing?.file || null,
+      });
+      added++;
+    }
+    this.save();
+    this.pump();
+    return added;
+  }
+
+  pump() {
+    while (!this.stopping && !this.clearing && this.active < cfg.concurrency) {
+      const job = this.jobs.find((j) => j.status === 'queued');
+      if (!job) return;
+      this.active++;
+      const task=this.run(job).finally(() => {
+        this.running.delete(task);
+        this.active--;
+        this.save();
+        this.pump();
+      });
+      this.running.add(task);
+    }
+  }
+
+  async run(job) {
+    const controller = new AbortController(); this.controllers.set(job.id,controller);
+    try {
+      job.status = 'resolving';
+      job.error = null;
+      job.reused=false;job.replacement=null;
+      const existingDir=path.join(job.profile?.downloadDir||cfg.downloadDir,safe(job.seriesName),`Season ${pad(job.season)}`);
+      const existingPrefix=`${safe(job.seriesName)} - S${pad(job.season)}E${pad(job.episode)} - `;
+      let entries=[];try{entries=fs.readdirSync(existingDir);}catch(e){if(e.code!=='ENOENT')throw e;}
+      for(const name of entries.filter(n=>n.startsWith(existingPrefix)&&n.endsWith('.corrupt-backup'))){
+        const backup=path.join(existingDir,name),original=backup.slice(0,-15);
+        if(!fs.existsSync(original)){fs.linkSync(backup,original);fs.unlinkSync(backup);}
+        else if(fs.statSync(original).ino===fs.statSync(backup).ino){fs.unlinkSync(backup);}
+        else throw new Error('Replacement recovery copy preserved at '+backup+'; resolve it before retrying');
+      }
+      const existingFile=findExisting(existingDir,existingPrefix,job.file);
+      if(existingFile){
+        job.status='verifying';job.stage='Checking existing file';job.speed=0;this.save();
+        const records=this.store?.read('verifiedFiles')||{};
+        try{
+          const checked=await (this.verifyExisting||verifyExisting)(existingFile,records[existingFile],controller.signal);
+          records[existingFile]=checked;this.store?.write('verifiedFiles',records);
+          job.file=existingFile;job.verification=checked.media;job.quality=checked.media.resolution+'p';
+          job.reused=true;job.stage='Already downloaded â€” verified';job.status='done';job.progress=1;job.peers=0;return;
+        }catch(e){
+          if(e.code!=='CORRUPT_MEDIA')throw e;
+          job.replacement={path:existingFile,...e.stamp};job.stage='Replacing damaged file';
+        }
+      }
+      job.status='resolving';
+      const mode = job.profile?.english ? "require" : job.profile ? "off" : effectiveDubMode(job.kind);
+      const key = `${job.series}|${job.season}`;
+      if (!this.seasonHashes.has(key)) this.seasonHashes.set(key, new Set());
+      const hashes = this.seasonHashes.get(key);
+
+      const streams = await this.streamsFor(job.id,controller.signal);
+      const choiceOptions = { mode, preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
+      const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
+      let choice = preferredSource ? pickBest([preferredSource], choiceOptions) : null;
+      if (!choice) choice = pickBest(streams, choiceOptions);
+      if (!choice) throw new Error(mode === 'require' ? 'No English dub found' : 'No streams found');
+      if (choice.infoHash) hashes.add(choice.infoHash);
+
+      job.quality = choice.res ? `${choice.res}p` : '?';
+      job.release = choice.title;
+      job.sourceProviders = choice.addonNames || [];
+      job.dub = choice.dub;
+      job.status = 'downloading';
+      this.save();
+
+      const dir = path.join(job.profile?.downloadDir||cfg.downloadDir, safe(job.seriesName), `Season ${pad(job.season)}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const prefix = `S${pad(job.season)}E${pad(job.episode)} - `;
+
+      job.attempts ||= [];
+      while(choice) {
+        let failure;
+        for(let attempt=0;attempt<3;attempt++) {
+          controller.signal.throwIfAborted();
+          try {
+            job.file = choice.url ? await this.downloadHttp(job,choice,dir,prefix) : await this.downloadTorrent(job,choice,dir,prefix);
+            failure=null;break;
+          } catch(e) { failure=e; if(controller.signal.aborted || e.code==='ENOSPC') throw e;
+            if(choice.url&&/HTTP (401|403|404|410)/.test(e.message)){const fresh=(await getStreams(job.id,{signal:controller.signal})).map(parseStream).find(candidate=>candidate.url&&candidate.filename&&candidate.filename===choice.filename&&candidate.res===choice.res);if(fresh){choice.url=fresh.url;choice.raw.behaviorHints=fresh.raw.behaviorHints;}}
+            job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:attempt+1,error:e.message,time:Date.now()});this.save();
+            // Retrying the same torrent cannot help when its swarm has no
+            // metadata/useful pieces, or when the selected file fails checks.
+            // Move on to another release after the first such failure.
+            if(/^(Timed out fetching torrent metadata|Stalled: no progress|Source must identify the episode file explicitly|Selected torrent file is not a video|Torrent file belongs to another episode|Actual video exceeds selected resolution|Actual resolution is outside the batch profile|Audio metadata shows no English track)/.test(e.message))break;
+            if(attempt<2) await new Promise(resolve=>setTimeout(resolve,1000*(attempt+1)));
+          }
+        }
+        if(!failure) break;
+        streams.splice(streams.indexOf(choice.raw),1);
+        choice=pickBest(streams,choiceOptions);
+        if(!choice) throw failure;
+        job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';job.fallbackReason='Previous source failed';job.stage='Switching to next source';this.save();
+      }
+      if(job.verification?.resolution)job.quality=job.verification.resolution+'p';
+      job.stage='Complete';
+      job.status = 'done';
+      job.progress = 1;
+      job.speed = 0;
+    } catch (e) {
+      if (!['paused','cancelled','queued'].includes(job.status)) job.status = e.code==='ENOSPC' ? 'paused' : 'failed';
+      job.error = controller.signal.aborted ? null : e.message;
+      job.speed = 0;
+    } finally {this.controllers.delete(job.id);}
+  }
+
+  async finishFile(job,source,destination) {
+    const signal=this.controllers.get(job.id)?.signal;
+    if(job.replacement){
+      job.stage='Verifying replacement';
+      const checked=await (this.verifyExisting||verifyExisting)(source,null,signal);
+      const current=await fingerprint(job.replacement.path,signal);
+      if(current.hash!==job.replacement.hash)throw new Error('Existing file changed; retry verification');
+      signal?.throwIfAborted();
+      finalize(source,destination,{...job.replacement,signature:current.signature});
+      const records=this.store?.read('verifiedFiles')||{};
+      delete records[job.replacement.path];records[destination]=checked;this.store?.write('verifiedFiles',records);
+      job.replacement=null;
+    }else{signal?.throwIfAborted();finalize(source,destination);}
+  }
+
+  // ---- direct (debrid) links, resumable via HTTP Range ----
+  async downloadHttp(job, c, dir, prefix) {
+    const name = c.filename || decodeURIComponent(path.basename(new URL(c.url).pathname)) || 'video.mkv';
+    const dest = path.join(dir, safe(job.seriesName||'Series')+' - '+prefix+safe(job.title||'Episode')+(path.extname(name)||'.mkv'));
+    const identity=createHash("sha256").update(c.url).digest("hex").slice(0,16);
+    const part = `${dest}.${identity}.part`;
+    const metaPath=part+".json";
+    let meta={};try{meta=JSON.parse(fs.readFileSync(metaPath))}catch{}
+    let start = 0;
+    try {
+      start = fs.statSync(part).size;
+    } catch {
+      /* fresh download */
+    }
+    if(!meta.validator) start=0;
+    const idle=new AbortController();let idleTimer;const resetIdle=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>idle.abort(new Error('HTTP transfer stalled')),cfg.stallMinutes*60000);idleTimer.unref();};resetIdle();
+    const signal=AbortSignal.any([this.controllers.get(job.id).signal,idle.signal]);
+    job.stage='Downloading video';
+    const res = await fetch(c.url, {signal, headers:{...c.raw.behaviorHints?.proxyHeaders?.request,...(start?{Range:'bytes='+start+'-','If-Range':meta.validator}:{})},redirect:'follow'});
+    if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status}`);
+    const resumed = res.status === 206;
+    if(resumed && (!start || !res.headers.get("content-range")?.startsWith(`bytes ${start}-`))) {await res.body.cancel();throw new Error("Invalid resume response");}
+    fs.writeFileSync(metaPath,JSON.stringify({validator:res.headers.get("etag")||res.headers.get("last-modified")}));
+    if (!resumed) start = 0;
+    const total = start + Number(res.headers.get('content-length') || 0);
+    job.totalBytes=total;
+    try{ensureSpace(dir,Math.max(0,total-start)+total)}catch(e){await res.body.cancel();throw e;}
+    let got = start;
+    let tick = Date.now();
+    let tickBytes = got;
+    const body = Readable.fromWeb(res.body);
+    body.on('data', (chunk) => {
+      resetIdle();
+      got += chunk.length;
+      if (total) job.progress = got / total;
+      const now = Date.now();
+      if (now - tick >= 1000) {
+        job.speed = ((got - tickBytes) * 1000) / (now - tick);
+        tick = now;
+        tickBytes = got;
+      }
+    });
+    try{await pipeline(body, fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' }));}finally{clearTimeout(idleTimer);}
+    if(total && got!==total) throw new Error("Incomplete response");
+    job.stage='Checking video and audio';
+    job.verification=await (this.inspectMedia || inspectMedia)(part,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions});
+    this.controllers.get(job.id)?.signal.throwIfAborted();
+    await this.finishFile(job,part,dest);
+    fs.unlinkSync(part);fs.unlinkSync(metaPath);
+    return dest;
+  }
+
+  // ---- torrents: only the wanted file is downloaded, even from a season pack ----
+  async acquire(c, signal) {
+    let e = this.torrents.get(c.infoHash);
+    if (!e) {
+      e = { refs: 0, torrent: null, promise: null, tmp: path.join(cfg.downloadDir, '.tmp', c.infoHash), metainfo: path.join(cfg.downloadDir, '.tmp', c.infoHash+'.torrent') };
+      this.torrents.set(c.infoHash, e);
+      // Some Stremio providers return only an info hash and a displayed seeder
+      // count. DHT alone can be unreachable on common home networks, so provide
+      // tracker fallbacks as well as any provider-supplied trackers.
+      const trackers = [...new Set([...(c.trackers || []),
+        'udp://tracker.opentrackr.org:1337/announce',
+        'udp://open.stealth.si:80/announce',
+        'udp://tracker.torrent.eu.org:451/announce',
+        'udp://tracker.dler.org:6969/announce',
+        'https://tracker.tamersunion.org:443/announce',
+      ])];
+      const magnet = `magnet:?xt=urn:btih:${c.infoHash}` + trackers.map((t) => `&tr=${encodeURIComponent(t)}`).join('');
+      const cached=readCachedTorrent(e.metainfo,c.infoHash);
+      e.promise = new Promise((resolve, reject) => {
+        this.getClient().then(client=>{const t = client.add(cached||magnet, { path: e.tmp, deselect: true });
+        e.torrent = t;
+        const timer = setTimeout(() => reject(new Error('Timed out fetching torrent metadata from peers')), cfg.metadataTimeoutSeconds * 1000);
+        t.on('metadata',()=>cacheTorrent(e.metainfo,t));
+        t.on('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+        t.on('ready', () => {
+          clearTimeout(timer);
+          cacheTorrent(e.metainfo,t);
+          resolve(e);
+        });
+        }).catch(reject);
+      });
+    }
+    e.refs++;
+    try {
+      if(signal){
+        let abort;try{await Promise.race([e.promise,new Promise((_,reject)=>{abort=()=>reject(new Error('Stopped'));if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});})]);}finally{signal.removeEventListener('abort',abort);}
+      }else await e.promise;
+    } catch (err) {
+      this.release(c.infoHash);
+      throw err;
+    }
+    return e;
+  }
+
+  release(infoHash) {
+    const e = this.torrents.get(infoHash);
+    if (!e) return;
+    e.refs--;
+    if (e.refs > 0) return;
+    this.torrents.delete(infoHash);
+    try {
+      e.torrent?.destroy();
+    } catch {
+      /* already gone */
+    }
+    // Keep verified pieces for restart recovery.
+  }
+
+  async downloadTorrent(job, c, dir, prefix) {
+    job.stage='Finding torrent metadata';
+    job.peers=0;
+    const peerMonitor=setInterval(()=>{job.peers=this.torrents.get(c.infoHash)?.torrent?.numPeers||0;},1000);
+    let e;
+    try { e = await this.acquire(c,this.controllers.get(job.id)?.signal); }
+    finally { clearInterval(peerMonitor); }
+    job.peers=e.torrent?.numPeers||0;
+    job.stage='Downloading video';
+    try {
+      const t = e.torrent;
+      const file=torrentEpisodeFile(t,c,job);
+      if (!file) throw new Error('Source must identify the episode file explicitly or by a matching filename');
+      if(!VIDEO_EXT.test(file.path))throw new Error("Selected torrent file is not a video");
+      const episodeTag=/s(\d+)[ ._-]*e(\d+)/i.exec(path.basename(file.path));if(episodeTag&&(Number(episodeTag[1])!==job.season||Number(episodeTag[2])!==job.episode))throw new Error("Torrent file belongs to another episode");
+      job.totalBytes=file.length;
+      ensureSpace(dir,Math.max(0,file.length-file.downloaded)+file.length);
+      file.select();
+
+      await new Promise((resolve, reject) => {
+        let last = -1;
+        let lastChange = Date.now();
+        const iv = setInterval(() => {
+          if(this.controllers.get(job.id)?.signal.aborted){clearInterval(iv);reject(new Error("Stopped"));return;}
+          job.progress = file.progress;
+          job.speed = t.downloadSpeed;
+          job.peers = t.numPeers;
+          if (file.progress >= 1) {
+            clearInterval(iv);
+            resolve();
+          } else if (file.downloaded !== last) {
+            last = file.downloaded;
+            lastChange = Date.now();
+          } else if (Date.now() - lastChange > cfg.stallMinutes * 60000) {
+            clearInterval(iv);
+            reject(new Error('Stalled: connected peers sent no usable pieces'));
+          }
+        }, 1000);
+      });
+
+      const src = path.join(t.path, file.path);
+      const dest = path.join(dir, safe(job.seriesName)+' - '+prefix+safe(job.title||'Episode')+path.extname(file.path));
+      job.verification=await (this.inspectMedia || inspectMedia)(src,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions});
+      this.controllers.get(job.id)?.signal.throwIfAborted();
+      await this.finishFile(job,src,dest);
+      return dest;
+    } finally {
+      this.release(c.infoHash);
+    }
+  }
+
+  control(id, action) {
+    if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
+    const job=this.jobs.find(j=>j.id===id);if(!job) throw new Error("Unknown job");
+    if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";this.controllers.get(id)?.abort();}
+    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done")job.status="queued";}
+    else throw new Error("Unknown action");
+    this.save();this.pump();
+  }
+
+  remove(id) {
+    if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
+    const index = this.jobs.findIndex(job => job.id === id);
+    if (index < 0) return false;
+    if (this.controllers.has(id)) throw new Error('Cancel the job and wait for it to stop before removing it');
+    this.jobs.splice(index, 1);
+    clearTimeout(this.saveTimer);
+    this.saveNow();
+    return true;
+  }
+
+  async clearAll() {
+    if (this.clearing) throw new Error('The queue is already being cleared');
+    this.clearing = true;
+    const removed = this.jobs.length;
+    for (const job of this.jobs) {
+      job.status = 'cancelled';
+      this.controllers.get(job.id)?.abort();
+    }
+    this.save();
+    try {
+      await Promise.allSettled([...this.running]);
+      this.jobs = [];
+      clearTimeout(this.saveTimer);
+      this.saveNow();
+      return removed;
+    } finally {
+      this.clearing = false;
+      this.pump();
+    }
+  }
+
+  async shutdown() {
+    this.stopping=true;
+    for(const [id,c] of this.controllers){
+      const job=this.jobs.find(item=>item.id===id);
+      if(job&&['resolving','downloading','verifying'].includes(job.status)){
+        job.status='queued';job.stage='Queued after restart';job.error=null;job.speed=0;
+      }
+      c.abort();
+    }
+    clearTimeout(this.saveTimer);
+    this.saveNow();
+    if(this.client)await new Promise(resolve=>this.client.destroy(resolve));
+    await Promise.allSettled([...this.running]);
+    clearTimeout(this.saveTimer);this.saveNow();
+  }
+}

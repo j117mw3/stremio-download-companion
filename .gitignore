@@ -1,0 +1,16 @@
+node_modules/
+dist*/
+downloads/
+config.json
+.env
+.env.*
+*.log
+*.sqlite*
+jobs.json*
+*.part*
+*.finalizing
+*.corrupt-backup
+test/*.png
+.release/
+test/live-download.js
+test/smoke.cjs
