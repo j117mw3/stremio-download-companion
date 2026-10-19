@@ -4,7 +4,7 @@ A Windows desktop companion for downloading an episode, a season, or selected se
 
 ## Install
 
-1. Download **Stremio Download Companion Setup 0.4.9.exe** from [the latest release](https://github.com/j117mw3/stremio-download-companion/releases/latest).
+1. Download **Stremio Download Companion Setup 0.4.10.exe** from [the latest release](https://github.com/j117mw3/stremio-download-companion/releases/latest).
 2. Quit an older companion using its tray menu, then run the installer. Existing downloads and queue data are retained.
 3. Open the companion, choose your download folder, and connect Stremio using **Install addon**. If needed, paste `http://127.0.0.1:7000/manifest.json` into Stremio's Addons page.
 
@@ -29,6 +29,14 @@ Only active episode files are selected in a season torrent. Episode speed measur
 Before requesting sources, the companion checks the saved episode path and its show/season folder. Healthy episodes are reused regardless of the newly selected quality. The first check reads the file and performs a full FFmpeg decode; subsequent checks compare its SHA-256 with a stored verification. The queue shows **Checking existing file**, then **Already downloaded — verified**. Checks can be cancelled.
 
 Confirmed damaged files are replaced only after the replacement passes verification. If replacement fails, the original is retained. Unavailable drives, access errors, or missing verification tools are reported rather than treated as corruption. Multiple matching files require manual resolution. A `.corrupt-backup` left by an interrupted replacement is retained or restored during recovery; do not discard it until the intended file is confirmed.
+
+When an episode receives no useful data for 30 seconds, the companion compares up to two distinct alternative sources. The current source keeps running during comparison. Requested quality is tested first, and lower qualities are considered only when explicitly allowed. Duplicate swarms are merged; unknown-resolution listings remain eligible for the normal serial download/inspection path but are not promoted by connectivity tests.
+
+Each candidate gets at most 30 seconds, with a 15-second setup deadline and a 16 MiB new-payload allowance (plus unavoidable boundary pieces and outstanding requests). Probe transfers use small piece windows or HTTP backpressure to measure continued progress without consuming the whole connection. For torrents, cached data or peers alone cannot win: a candidate must deliver newly verified episode data and sustained progress, or complete a small verified file. HTTP candidates must deliver a video response and continued payload progress. Final media/audio checks still apply.
+
+Source tests and the extra-episode slot share two additional network slots globally. Tests are fair across waiting episodes. A working winner is promoted in place, preserving its test data. If the original recovers, it is retained. Limits are recorded as inconclusive, not permanent source failures. Recent connectivity observations expire after 15 minutes and guide source ordering; another episode's availability is always checked separately.
+
+Switching releases may reset an episode's displayed percentage because different releases cannot share arbitrary bytes. The previous source-specific partial remains available. Pausing, cancelling, clearing the queue, or quitting stops that episode's tests as well. The queue reports **Testing alternative sources**, received versus verified bytes, and a release-switch explanation.
 
 The right-hand series navigator replaces the page scrollbar with labelled segments sized to each show's share of the queue. Each segment shows overall progress across queued episodes, including partial progress. Click a series to jump, or drag the marker to scroll. Each episode bar displays its percentage. Paused episodes remain paused.
 

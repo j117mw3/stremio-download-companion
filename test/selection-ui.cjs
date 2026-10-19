@@ -189,10 +189,11 @@ app.whenReady().then(async () => {
 
   backend.downloader.jobs = [
     {id:'fixture:1:1',seriesName:'Fixture Show',season:1,episode:1,status:'retry_wait',stage:'Retry scheduled',nextRetryAt:Date.now()+300000,speed:0,progress:.2},
-    {id:'fixture:1:2',seriesName:'Fixture Show',season:1,episode:2,status:'downloading',stage:'Waiting for useful pieces',speed:0,torrentSpeed:1048576,peers:4,progress:.1},
+    {id:'fixture:1:2',seriesName:'Fixture Show',season:1,episode:2,status:'downloading',stage:'Waiting for useful pieces',speed:0,torrentSpeed:1048576,peers:4,progress:.1,comparison:{status:'testing',candidates:[{bytes:1048576,verifiedBytes:524288}]}},
     {id:'fixture:1:3',seriesName:'Fixture Show',season:1,episode:3,status:'needs_attention',stage:'Needs attention',speed:0,progress:0}
   ];
   await js('tick()');
+  check(await js("document.getElementById('t').textContent.includes('Testing alternative sources') && document.getElementById('t').textContent.includes('1.0 MiB received') && document.getElementById('t').textContent.includes('0.5 MiB verified')"), 'source comparison feedback distinguishes received and verified candidate bytes');
   check(await js("document.getElementById('t').textContent.includes('Next retry:') && document.getElementById('t').textContent.includes('Waiting for useful pieces') && document.getElementById('t').textContent.includes('Shared torrent traffic: 1.0 MB/s') && document.getElementById('t').textContent.includes('Needs attention') && document.getElementById('t').textContent.includes('0.0 MB/s')"), 'queue distinguishes retry time, stalled episode speed, shared traffic, and Needs attention');
   backend.downloader.jobs.push(
     {id:'other:1:1',series:'other',seriesName:'Other Series',season:1,episode:1,status:'done',progress:1},

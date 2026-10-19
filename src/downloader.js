@@ -1,3 +1,5 @@
+import {setTimeout as delay} from 'node:timers/promises';
+import {ExtraBudget,ConnectivityEvidence,compareSources,verifiedFileBytes,probeSelection,TEST_LIMIT,testStopped} from './source-testing.js';
 import {failure, prepareTorrent, selectFile, FileProgress, RETRY_DELAYS, SOURCE_FAILURES} from './transfer-state.js';
 import {findExisting, verifyExisting, fingerprint} from './existing.js';
 import { finalize } from './finalize.js';
@@ -84,13 +86,14 @@ export class Downloader {
     this.torrents = new Map(); // infoHash -> { refs, promise, torrent, tmp }
     this.seasonHashes = new Map(); // series|season -> Set(infoHash) chosen so far
     this.saveTimer = null;
-    this.cooldowns={};
+    this.cooldowns={};this.contexts=new Map();this.extraBudget=new ExtraBudget(2);this.sourceResults={};
     this.load();
   }
 
   load() {
     const cooldowns=this.store.read('sourceCooldowns');
     this.cooldowns=cooldowns&&!Array.isArray(cooldowns)&&typeof cooldowns==='object'?cooldowns:{};
+    const results=this.store.read('sourceResults');this.sourceResults=results&&!Array.isArray(results)&&typeof results==='object'?results:{};
     this.jobs=this.store.read('jobs');
     if(this.jobs===null){
       this.jobs=[];
@@ -103,7 +106,7 @@ export class Downloader {
       this.store.write('jobs',this.jobs);
     }
     if(!Array.isArray(this.jobs))throw new Error('Saved queue is invalid; original database preserved');
-    for(const job of this.jobs)if(['downloading','resolving','verifying'].includes(job.status))job.status='queued';
+    for(const job of this.jobs){job.comparison=null;job.isProbe=false;if(['downloading','resolving','verifying'].includes(job.status))job.status='queued';}
     this.pump();
   }
 
@@ -116,6 +119,7 @@ export class Downloader {
     fs.mkdirSync(cfg.downloadDir, { recursive: true });
     this.store.write('jobs',this.jobs);
     this.store.write('sourceCooldowns',this.cooldowns||{});
+    this.store.write('sourceResults',this.sourceResults||{});
   }
 
   async getClient() {
@@ -171,6 +175,15 @@ export class Downloader {
       (cooldowns[job.id+'|'+this.sourceKey(source)]||0)<=this.now();
   }
 
+  connectivityScore(job,source) {
+    const results=this.sourceResults||{},now=this.now(),exact=results[this.sourceKey(source)];
+    if(exact?.expires>now&&exact.status==='working')return exact.speed||0;
+    const swarmKey=createHash('sha256').update(String(source.infoHash||source.url)).digest('hex');
+    const seriesKey=createHash('sha256').update(String(job.series)).digest('hex');
+    const positive=Object.values(results).filter(r=>r.expires>now&&r.status==='working'&&r.swarmKey===swarmKey&&r.seriesKey===seriesKey);
+    return positive.length?Math.max(...positive.map(r=>r.speed||0)):0;
+  }
+
   cool(job,source,error) {
     this.cooldowns||={};
     const key=error.code==='METADATA_TIMEOUT'?'torrent:'+source.infoHash:job.id+'|'+this.sourceKey(source);
@@ -187,7 +200,7 @@ export class Downloader {
   pump() {
     clearTimeout(this.retryTimer);
     if(this.stopping||this.clearing)return;
-    const now=this.now();
+    const now=this.now();this.extraBudget||=new ExtraBudget(2);
     for(const job of this.jobs)if(job.status==='retry_wait'&&job.nextRetryAt<=now){job.status='queued';job.nextRetryAt=null;}
     const stalled=this.jobs.filter(j=>this.controllers.has(j.id)&&['downloading','resolving'].includes(j.status)&&now-(j.lastProgressAt??j.runStartedAt??now)>=30000);
     const canProbe=stalled.length>0&&!this.jobs.some(j=>j.isProbe&&this.controllers.has(j.id));
@@ -197,10 +210,12 @@ export class Downloader {
       const probe=this.active>=cfg.concurrency;
       const job = (probe&&stalled.length?queued.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||queued[0];
       if (!job) break;
+      const releaseExtra=probe?this.extraBudget.tryAcquire():null;
+      if(probe&&!releaseExtra)break;
       job.isProbe=probe;
       this.active++;
       const task=this.run(job).finally(() => {
-        this.running.delete(task);this.active--;this.save();this.pump();
+        releaseExtra?.();this.running.delete(task);this.active--;this.save();this.pump();
       });
       this.running.add(task);
     }
@@ -249,7 +264,7 @@ export class Downloader {
       try{streams=await this.streamsFor(job.id,controller.signal);}catch(e){controller.signal.throwIfAborted();throw failure('PROVIDER_FAILURE',e.message);}
       const originalCount=streams.length;
       streams=streams.filter(raw=>this.available(job,parseStream(raw)));
-      const choiceOptions = { mode, preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
+      const choiceOptions = { mode, connectivityScore:source=>this.connectivityScore(job,source), preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
       const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
       const choose=sources=>pickBest(sources.filter(raw=>!job.recentSources?.includes(this.sourceKey(parseStream(raw)))),choiceOptions)||pickBest(sources,choiceOptions);
       let choice = preferredSource&&!job.recentSources?.includes(this.sourceKey(parseStream(preferredSource))) ? pickBest([preferredSource], choiceOptions) : null;
@@ -275,10 +290,11 @@ export class Downloader {
         job.speed=0;job.torrentSpeed=0;job.progress=0;
         job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';
         try {
-          job.file=choice.url?await this.downloadHttp(job,choice,dir,prefix):await this.downloadTorrent(job,choice,dir,prefix);
+          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix);
           if(choice.infoHash)hashes.add(choice.infoHash);
           break;
         }catch(e){
+          if(e.sourceChoice)choice=e.sourceChoice;
           if(controller.signal.aborted||!SOURCE_FAILURES.has(e.code))throw e;
           this.cool(job,choice,e);
           job.recentSources=[...(job.recentSources||[]).filter(key=>key!==this.sourceKey(choice)),this.sourceKey(choice)].slice(-100);
@@ -304,7 +320,79 @@ export class Downloader {
       }
       job.error = controller.signal.aborted ? null : e.message;
       job.speed = 0;
-    } finally {job.speed=0;job.torrentSpeed=0;job.isProbe=false;this.controllers.delete(job.id);}
+    } finally {job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;this.controllers.delete(job.id);}
+  }
+
+  startAttempt(parent,choice,probe,ownerSignal,dir,prefix) {
+    this.contexts||=new Map();
+    const id=parent.id+'#'+this.sourceKey(choice)+'#'+Math.random().toString(16).slice(2);
+    const controller=new AbortController();
+    const signal=AbortSignal.any([ownerSignal,controller.signal]);
+    const job={...parent,id,comparison:null,progress:0,speed:0,lastProgressAt:null};
+    this.controllers.set(id,{signal,abort:()=>controller.abort()});
+    let adopt;
+    const adoption=new Promise(resolve=>adopt=resolve);
+    const attempt={job,choice,probe,started:this.now(),evidence:new ConnectivityEvidence(this.now()),cancel:()=>controller.abort(testStopped('Source test cancelled'))};
+    const context={attempt,signal,adopted:!probe,bytes:0,previous:0,baseline:0,verifiedBaseline:0,started:this.now()};
+    let connectTimer,totalTimer;
+    context.ready=()=>{attempt.evidence.ready=true;clearTimeout(connectTimer);};
+    context.observe=(bytes,verified=0,complete=false,video=false)=>{
+      context.bytes+=Math.max(0,bytes-context.previous);context.previous=bytes;
+      attempt.evidence.update(context.bytes,Math.max(0,verified-context.verifiedBaseline),this.now(),{complete,video});
+      if(probe&&!context.adopted&&context.bytes>=TEST_LIMIT){context.capped=true;if(!attempt.evidence.qualifies(!!choice.infoHash))controller.abort(testStopped('Source test reached its traffic limit'));}
+    };
+    context.beforeFinalize=async()=>{
+      if(context.adopted)return;
+      await new Promise((resolve,reject)=>{
+        const abort=()=>{signal.removeEventListener('abort',abort);reject(signal.reason);};
+        if(signal.aborted)return abort();
+        signal.addEventListener('abort',abort,{once:true});adoption.then(()=>{signal.removeEventListener('abort',abort);resolve();});
+      });
+      signal.throwIfAborted();
+    };
+    attempt.promote=()=>{attempt.probe=false;context.adopted=true;clearTimeout(connectTimer);clearTimeout(totalTimer);adopt();};
+    if(probe){connectTimer=setTimeout(()=>controller.abort(testStopped('Source test connection deadline reached')),15000);totalTimer=setTimeout(()=>controller.abort(testStopped('Source test time limit reached')),30000);}
+    this.contexts.set(id,context);
+    attempt.promise=(choice.url?this.downloadHttp(job,choice,dir,prefix):this.downloadTorrent(job,choice,dir,prefix)).finally(()=>{clearTimeout(connectTimer);clearTimeout(totalTimer);this.controllers.delete(id);this.contexts.delete(id);});
+    return attempt;
+  }
+
+  async downloadWithComparison(job,choice,streams,options,dir,prefix) {
+    this.extraBudget||=new ExtraBudget(2);this.sourceResults||={};
+    const candidates=[];const seen=new Set([choice.infoHash?'torrent:'+choice.infoHash:'url:'+choice.url]);
+    let remaining=streams.filter(raw=>this.available(job,parseStream(raw)));
+    while(remaining.length&&candidates.length<2){
+      const target=remaining.filter(raw=>parseStream(raw).res===job.profile?.resolution);
+      const selected=pickBest(target,options)||pickBest(remaining,options);if(!selected)break;
+      remaining=remaining.filter(raw=>raw!==selected.raw);
+      const identity=selected.infoHash?'torrent:'+selected.infoHash:'url:'+selected.url;
+      if(seen.has(identity)||!selected.res)continue;seen.add(identity);candidates.push(selected);
+    }
+    const signal=this.controllers.get(job.id).signal;
+    const sync=attempt=>{
+      for(const key of ['progress','speed','torrentSpeed','peers','downloadedBytes','idleSeconds','lastProgressAt','stage','totalBytes'])job[key]=attempt.job[key];
+    };
+    const tested=[];
+    const result=await compareSources({signal,primary:choice,candidates,budget:this.extraBudget,now:()=>this.now(),
+      start:(source,probe,owner)=>{
+        const attempt=this.startAttempt(job,source,probe,owner,dir,prefix);
+        if(probe)tested.push(attempt);
+        return attempt;
+      },
+      onView:(phase,attempt)=>{
+        if(!attempt.probe)sync(attempt);
+        job.comparison=phase==='testing'?{status:'testing',candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,score:test.evidence.score(this.now())}))}:null;
+        if(phase==='switching'){job.release=attempt.choice.title;job.sourceProviders=attempt.choice.addonNames||[];job.quality=attempt.choice.res?attempt.choice.res+'p':'?';job.stage='Switching to a verified working source';job.switchNote='Different release selected; percentage reflects this release. Previous partial download retained.';}
+      },
+      onResult:(source,outcome)=>{
+        const key=this.sourceKey(source);this.sourceResults[key]={...outcome,time:this.now(),expires:this.now()+15*60000,swarmKey:createHash('sha256').update(String(source.infoHash||source.url)).digest('hex'),seriesKey:createHash('sha256').update(String(job.series)).digest('hex')};
+        for(const [key,value] of Object.entries(this.sourceResults))if(value.expires<this.now())delete this.sourceResults[key];
+        this.save();
+      }
+    });
+    Object.assign(job,{verification:result.attempt.job.verification,release:result.attempt.choice.title,sourceProviders:result.attempt.choice.addonNames||[],quality:result.attempt.choice.res?result.attempt.choice.res+'p':'?',comparison:null});
+    job.replacement=result.attempt.job.replacement;
+    return result.file;
   }
 
   async checkMedia(file,options) {
@@ -346,8 +434,9 @@ export class Downloader {
     job.stage='Downloading video';
     let speedTimer;
     try {
-    let res;try{res = await fetch(c.url, {signal, headers:{...c.raw.behaviorHints?.proxyHeaders?.request,...(start?{Range:'bytes='+start+'-','If-Range':meta.validator}:{})},redirect:'follow'});}catch(e){this.controllers.get(job.id)?.signal.throwIfAborted();if(idle.signal.aborted)throw idle.signal.reason;throw failure('HTTP_FAILURE','HTTP connection failed');}
+    let res;try{res = await fetch(c.url, {signal, headers:{...c.raw.behaviorHints?.proxyHeaders?.request,...(start?{Range:'bytes='+start+'-','If-Range':meta.validator}:{})},redirect:'follow'});}catch(e){if(this.controllers.get(job.id)?.signal.aborted)throw this.controllers.get(job.id).signal.reason;if(idle.signal.aborted)throw idle.signal.reason;throw failure('HTTP_FAILURE','HTTP connection failed');}
     if (!res.ok && res.status !== 206){await res.body?.cancel();throw failure('HTTP_FAILURE',`HTTP ${res.status}`,{status:res.status});}
+    const context=this.contexts?.get(job.id);context?.ready();
     const resumed = res.status === 206;
     if(resumed && (!start || !res.headers.get("content-range")?.startsWith(`bytes ${start}-`))) {await res.body.cancel();throw failure('HTTP_RESUME','Invalid resume response');}
     fs.writeFileSync(metaPath,JSON.stringify({validator:res.headers.get("etag")||res.headers.get("last-modified")}));
@@ -356,18 +445,27 @@ export class Downloader {
     job.totalBytes=total;
     try{ensureSpace(dir,Math.max(0,total-start)+total)}catch(e){await res.body.cancel();throw e;}
     let got = start;
+    if(context){context.previous=got;context.baseline=got;}
+    let header=Buffer.alloc(0);
+    const videoType=/^video\//i.test(res.headers.get('content-type')||'');
     const meter=new FileProgress(got,this.now());
     speedTimer=setInterval(()=>{job.speed=meter.sample(got,this.now()).speed;},1000);
     const body = Readable.fromWeb(res.body);
     body.on('data', (chunk) => {
       resetIdle();
       got += chunk.length;
+      if(header.length<512)header=Buffer.concat([header,chunk.subarray(0,512-header.length)]);
+      const sniff=header.subarray(0,4).toString('hex')==='1a45dfa3'||header.subarray(4,8).toString()==='ftyp'||header.subarray(0,4).toString()==='RIFF'||header[0]===0x47;
+      const video=sniff||(videoType&&!/^\s*(?:<|\{|\[)/.test(header.toString()));
+      context?.observe(got,0,total>0&&got===total,video);
       job.lastProgressAt=this.now();job.idleSeconds=0;job.downloadedBytes=got;
       if (total) job.progress = got / total;
 
     });
-    try{await pipeline(body, fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' }),{signal});}catch(e){this.controllers.get(job.id)?.signal.throwIfAborted();if(idle.signal.aborted)throw idle.signal.reason;if(['ECONNRESET','ETIMEDOUT','ERR_STREAM_PREMATURE_CLOSE'].includes(e.code))throw failure('HTTP_FAILURE','HTTP connection interrupted');throw e;}finally{clearTimeout(idleTimer);}
+    const throttle=async function*(source){for await(const chunk of source){if(context?.capped&&!context.adopted)await context.beforeFinalize();if(context?.attempt.probe&&!context.adopted)await delay(Math.ceil(chunk.length/1048576*1000),undefined,{signal});yield chunk;}};
+    try{await pipeline(body,throttle,fs.createWriteStream(part, { flags: resumed ? 'a' : 'w' }),{signal});}catch(e){if(this.controllers.get(job.id)?.signal.aborted)throw this.controllers.get(job.id).signal.reason;if(idle.signal.aborted)throw idle.signal.reason;if(['ECONNRESET','ETIMEDOUT','ERR_STREAM_PREMATURE_CLOSE'].includes(e.code))throw failure('HTTP_FAILURE','HTTP connection interrupted');throw e;}finally{clearTimeout(idleTimer);}
     if(total && got!==total) throw failure('HTTP_INCOMPLETE','Incomplete response');
+    await this.contexts?.get(job.id)?.beforeFinalize();
     job.stage='Checking video and audio';
     job.verification=await this.checkMedia(part,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions,signal:this.controllers.get(job.id)?.signal});
     this.controllers.get(job.id)?.signal.throwIfAborted();
@@ -419,7 +517,7 @@ export class Downloader {
     e.refs++;
     try {
       if(signal){
-        let abort;try{await Promise.race([e.promise,new Promise((_,reject)=>{abort=()=>reject(new Error('Stopped'));if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});})]);}finally{signal.removeEventListener('abort',abort);}
+        let abort;try{await Promise.race([e.promise,new Promise((_,reject)=>{abort=()=>reject(signal.reason?.code==='TEST_INCONCLUSIVE'?signal.reason:new Error('Stopped'));if(signal.aborted)abort();else signal.addEventListener('abort',abort,{once:true});})]);}finally{signal.removeEventListener('abort',abort);}
       }else await e.promise;
     } catch (err) {
       this.release(c.infoHash);
@@ -452,7 +550,7 @@ export class Downloader {
     finally { clearInterval(peerMonitor); }
     job.peers=e.torrent?.numPeers||0;
     job.stage='Downloading video';
-    let unselect;
+    let unselect,windowSelection;
     try {
       const t = e.torrent;
       const file=torrentEpisodeFile(t,c,job);
@@ -461,17 +559,24 @@ export class Downloader {
       const episodeTag=/s(\d+)[ ._-]*e(\d+)/i.exec(path.basename(file.path));if(episodeTag&&(Number(episodeTag[1])!==job.season||Number(episodeTag[2])!==job.episode))throw failure('SOURCE_FILE','Torrent file belongs to another episode');
       job.totalBytes=file.length;
       ensureSpace(dir,Math.max(0,file.length-file.downloaded)+file.length);
-      unselect=selectFile(e,file);
+      const context=this.contexts?.get(job.id);
+      if(context){context.previous=file.downloaded;context.verifiedBaseline=verifiedFileBytes(t,file);context.ready();}
+      if(context?.attempt.probe&&!context.adopted)windowSelection=probeSelection(e,file);
+      else unselect=selectFile(e,file);
       await new Promise((resolve,reject)=>{
         const signal=this.controllers.get(job.id)?.signal;
         const progress=new FileProgress(file.downloaded,this.now());
         let iv;
         const finish=error=>{clearInterval(iv);signal?.removeEventListener('abort',abort);t.removeListener('error',onError);error?reject(error):resolve();};
-        const abort=()=>finish(new Error('Stopped'));
+        const abort=()=>finish(signal?.reason?.code==='TEST_INCONCLUSIVE'?signal.reason:new Error('Stopped'));
         const onError=error=>finish(failure('TORRENT_FAILURE',error.message));
         const poll=()=>{
           if(signal?.aborted)return abort();
+          if(t.destroyed)return finish(failure('TORRENT_FAILURE','Torrent connection closed'));
           const sample=progress.sample(file.downloaded,this.now());
+          context?.observe(file.downloaded,verifiedFileBytes(t,file),file.progress>=1);
+          if(context?.adopted&&windowSelection){windowSelection.release();windowSelection=null;unselect=selectFile(e,file);}
+          else if(context?.capped)windowSelection?.release();else windowSelection?.advance();
           job.progress=file.progress;job.speed=sample.speed;job.torrentSpeed=t.downloadSpeed;job.peers=t.numPeers;
           job.downloadedBytes=file.downloaded;job.idleSeconds=Math.floor(sample.idleMs/1000);
           if(sample.speed>0)job.lastProgressAt=this.now();
@@ -483,6 +588,7 @@ export class Downloader {
         iv=setInterval(poll,1000);poll();
       });
 
+      await this.contexts?.get(job.id)?.beforeFinalize();
       const src = path.join(t.path, file.path);
       const dest = path.join(dir, safe(job.seriesName)+' - '+prefix+safe(job.title||'Episode')+path.extname(file.path));
       job.verification=await this.checkMedia(src,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions,signal:this.controllers.get(job.id)?.signal});
@@ -490,7 +596,7 @@ export class Downloader {
       await this.finishFile(job,src,dest);
       return dest;
     } finally {
-      unselect?.();
+      windowSelection?.release();unselect?.();
       job.speed=0;job.torrentSpeed=0;
       this.release(c.infoHash);
     }

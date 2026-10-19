@@ -17,8 +17,8 @@ const job=(root,n)=>({id:'show:1:'+n,series:'show',seriesName:'Show',season:1,ep
 test('two exhausted jobs release both slots and later healthy episodes proceed',async()=>{
  const root=fs.mkdtempSync(path.join(os.tmpdir(),'recovery-'));const d=worker();let calls={};
  d.jobs=[1,2,3,4].map(n=>job(root,n));d.streamsFor=async()=>[1,2,3,4].map(source);
- d.downloadTorrent=async(j)=>{calls[j.id]=(calls[j.id]||0)+1;if(j.episode<=2)throw failure('TORRENT_FAILURE','failed');return 'healthy';};
- try{d.pump();for(let i=0;i<40&&d.jobs.some(j=>['queued','downloading','resolving'].includes(j.status));i++)await new Promise(setImmediate);
+ d.downloadTorrent=async(j)=>{const id=j.id.split('#')[0];calls[id]=(calls[id]||0)+1;if(j.episode<=2)throw failure('TORRENT_FAILURE','failed');return 'healthy';};
+ try{d.pump();for(let i=0;i<100&&d.jobs.some(j=>['queued','downloading','resolving'].includes(j.status));i++)await new Promise(resolve=>setTimeout(resolve,20));
  assert.deepEqual(d.jobs.map(j=>j.status),['retry_wait','retry_wait','done','done']);
  assert.equal(calls['show:1:1'],3);assert.equal(calls['show:1:2'],3);assert.equal(d.active,0);
  }finally{d.stopping=true;clearTimeout(d.retryTimer);fs.rmSync(root,{recursive:true,force:true});}

@@ -160,7 +160,7 @@ export function parseStream(s) {
  * Pick the best stream: English-labeled audio first (unless mode is "off"), then highest resolution,
  * then direct links and sources with the most seeders; reuse a season torrent only to break ties.
  */
-export function pickBest(streams, { mode, preferHashes = new Set(), maxResolution = 0, allowedResolutions } = {}) {
+export function pickBest(streams, { mode, preferHashes = new Set(), maxResolution = 0, allowedResolutions, connectivityScore = () => 0 } = {}) {
   let list = streams.filter(s => /^[a-f0-9]{40}$/i.test(s.infoHash||'') || /^https?:\/\//i.test(s.url||'')).map(parseStream);
   // Providers often omit resolution labels (especially for older episode files
   // and season packs). Keep those candidates so media inspection can measure
@@ -181,6 +181,7 @@ export function pickBest(streams, { mode, preferHashes = new Set(), maxResolutio
     (a, b) =>
       dubW(b) - dubW(a) ||
       b.res - a.res ||
+      connectivityScore(b) - connectivityScore(a) ||
       Number(!!b.url) - Number(!!a.url) ||
       (b.seeders || 0) - (a.seeders || 0) ||
       prefW(b) - prefW(a),

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.10
+
+- Compare up to two distinct sources after 30 seconds without useful episode data, while the original keeps running.
+- Respect quality/audio settings and prefer requested quality over explicitly permitted fallbacks.
+- Require new verified torrent pieces or a continuing HTTP video response, rather than trusting peers, cached bytes, or seed counts.
+- Share two extra slots between source comparisons and extra-episode work; bound setup, test duration, and payload use.
+- Promote successful candidates without reconnecting, retain original partials, and keep the original when it recovers.
+- Persist short-lived anonymous connectivity observations and expose candidate feedback in the queue/source APIs.
+- Cancel all owned tests on pause, cancel, clear, or shutdown; recover interrupted comparisons safely after restart.
+
 ## 0.4.9
 
 - Try one extra episode after 30 seconds without useful data, without interrupting existing downloads.
