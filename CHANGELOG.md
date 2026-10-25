@@ -54,3 +54,13 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Yield slow jobs behind ready queue work without discarding source-specific partials, then resume them fairly when capacity opens.
 - Show rolling rates, source-comparison progress, candidate rates, and when an episode waits behind other downloads.
 - Store expiring source-speed history under opaque identifiers and mark a source slow only after a confirmed speed comparison.
+
+## 0.4.12
+
+- Increase the built-in normal download concurrency from two to four while retaining a shared budget of two extra network activities.
+- Fail over on torrent metadata timeouts after 15 seconds; compare other eligible sources after 15 seconds without useful episode data and resolve no-data attempts within 45 seconds.
+- Keep candidate limits, verified episode-data checks, source quality/audio restrictions, and the clear-win switching threshold.
+- Try no more than three distinct sources in one scheduling turn and keep later ready episodes moving when sources are unavailable.
+- Replace terminal source failures with persisted deferred retries after the existing 5, 15, and 60-minute cycle: 30 minutes, one hour, then every two hours.
+- Run at most one deferred retry at a time and only after fresh queued work drains; migrate source-related Needs attention jobs into this retry path.
+- Show source wait, metadata wait, comparison progress, and deferred retry timing in queue feedback and job responses.

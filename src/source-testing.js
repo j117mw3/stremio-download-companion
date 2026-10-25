@@ -56,7 +56,7 @@ export const testStopped=reason=>failure('TEST_INCONCLUSIVE',reason);
 
 // The shared budget admits waiting first candidates before second candidates.
 // Up to two alternatives may run together when capacity is available.
-export async function compareSources({signal,primary,candidates,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch}){
+export async function compareSources({signal,primary,candidates,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch,noDataAfterMs=15000,noDataLimitMs=45000,comparisonLimitMs=30000}){
   const active=new Set();let original,adopted,testing=false,testDone=false,testTask=null,stop;
   const owned=new AbortController();const combined=AbortSignal.any([signal,owned.signal]);
   const own=(choice,probe)=>{const attempt=start(choice,probe,combined);active.add(attempt);attempt.promise.then(value=>{attempt.result={value};},error=>{attempt.result={error};});return attempt;};
@@ -73,6 +73,7 @@ export async function compareSources({signal,primary,candidates,start,budget,now
   };
   const test=async()=>{
     const session=new AbortController();const testSignal=AbortSignal.any([combined,session.signal]);
+    const comparisonTimer=setTimeout(()=>session.abort(testStopped('Source comparison time limit reached')),comparisonLimitMs);
     const pool=new Set();let finished=0;
     const workers=candidates.slice(0,2).map(async(choice,index)=>{
       let release,candidate;
@@ -88,7 +89,7 @@ export async function compareSources({signal,primary,candidates,start,budget,now
           if(candidate.result){
             const qualifies=candidate.evidence.qualifies(!!choice.infoHash);
             const code=candidate.result.error?.code||null;
-            const status=code==='TEST_INCONCLUSIVE'?(qualifies?'working':'inconclusive'):['ENOSPC','VERIFY_UNAVAILABLE'].includes(code)?'inconclusive':'failed';
+            const status=code==='TEST_INCONCLUSIVE'?(qualifies?'working':'inconclusive'):['ENOSPC','VERIFY_UNAVAILABLE','METADATA_TIMEOUT','HTTP_STALL'].includes(code)?'inconclusive':'failed';
             onResult(choice,{status,bytes:candidate.evidence.bytes,verifiedBytes:candidate.evidence.verified,speed:candidate.evidence.score(now()),code});
             break;
           }
@@ -121,6 +122,7 @@ export async function compareSources({signal,primary,candidates,start,budget,now
       }
     }finally{
       session.abort(testStopped('Comparison sampling finished'));
+      clearTimeout(comparisonTimer);
       const results=await all;
       const failed=results.find(r=>r.status==='rejected');if(failed&&!combined.aborted)throw failed.reason;
       testDone=true;
@@ -133,8 +135,8 @@ export async function compareSources({signal,primary,candidates,start,budget,now
       if(adopted!==original){onView('primary',adopted);if(adopted.result){if(adopted.result.error){onResult(adopted.choice,{status:['ENOSPC','VERIFY_UNAVAILABLE'].includes(adopted.result.error.code)?'inconclusive':'failed',code:adopted.result.error.code});throw Object.assign(adopted.result.error,{sourceChoice:adopted.choice});}return {file:adopted.result.value,attempt:adopted,switched:true};}await new Promise(resolve=>setTimeout(resolve,100));continue;}
       if(original.result&&!original.result.error)return {file:original.result.value,attempt:original,switched:false};
       if(original.result?.error&&!['NO_USEFUL_PIECES','HTTP_STALL'].includes(original.result.error.code))throw original.result.error;
-      const idle=now()-(original.job.lastProgressAt??original.started);
-      const idleDue=idle>=30000,slowDue=!!shouldCompare(original.job);
+      const idle=now()-(original.job.lastProgressAt??original.job.dataStartedAt??original.started);
+      const idleDue=idle>=noDataAfterMs,slowDue=!!shouldCompare(original.job);
       if(testing&&triggerMode==='idle'&&slowDue)triggerMode='slow';
       if(testing&&testDone&&recovered()){testing=false;testDone=false;testTask=null;recoveryStart=null;triggerMode=null;}
       if(!testing&&(idleDue||slowDue)){
@@ -146,7 +148,11 @@ export async function compareSources({signal,primary,candidates,start,budget,now
         original.cancel();await original.promise.catch(()=>{});return {yielded:true,attempt:original,switched:false};
       }
       if(stop)throw stop;
-      if(original.result?.error&&(!testing||testDone||idle>=90000))throw original.result.error;
+      if(original.result?.error&&(!testing||testDone))throw original.result.error;
+      if(!original.result&&idle>=noDataLimitMs){
+        original.cancel();await original.promise.catch(()=>{});
+        throw failure(primary.infoHash?'NO_USEFUL_PIECES':'HTTP_STALL',primary.infoHash?'No verified episode data within 45 seconds':'No valid HTTP video payload within 45 seconds');
+      }
       onView(testing&&!testDone?'testing':'primary',adopted);
       await new Promise(resolve=>setTimeout(resolve,100));
     }

@@ -66,7 +66,7 @@ app.get('/api/search',async(req,res)=>{try{const q=String(req.query.q||'').trim(
 app.post('/api/settings', (req,res)=>{const directory=req.body.downloadDir;if(typeof directory!=='string'||!path.isAbsolute(directory))return res.sendStatus(400);try{fs.mkdirSync(directory,{recursive:true});fs.accessSync(directory,fs.constants.W_OK);dl.store.write('preferences',{downloadDir:directory});cfg.downloadDir=directory;res.json({downloadDir:directory})}catch{res.status(400).json({error:'Folder is not writable'})}});
 app.get('/api/settings',(req,res)=>res.json({downloadDir:cfg.downloadDir}));
 app.get('/api/health',(req,res)=>res.json({app:'stremio-download-companion',version,ready:true}));
-app.get('/api/jobs', (req, res) => res.json(dl.jobs.map(job=>({...job,canRemove:!dl.controllers.has(job.id)}))));
+app.get('/api/jobs', (req, res) => {const now=Date.now();res.json(dl.jobs.map(job=>({...job,canRemove:!dl.controllers.has(job.id),retryClass:job.status==='deferred'?'background':job.status==='retry_wait'?'scheduled':null,sourceWaitElapsedSeconds:Number.isFinite(job.sourceWaitStartedAt)?Math.max(0,Math.floor((now-job.sourceWaitStartedAt)/1000)):null,metadataWaitElapsedSeconds:Number.isFinite(job.metadataWaitStartedAt)?Math.max(0,Math.floor((now-job.metadataWaitStartedAt)/1000)):null})));});
 
 app.get('/', (req, res) => res.set('Cache-Control','no-store').type('html').send(PAGE.replaceAll('__TOKEN__',token)));
 
@@ -122,7 +122,7 @@ button{cursor:pointer;background:#5741a0}button:disabled{opacity:.45;cursor:defa
 .bar{background:#2a2a38;border-radius:4px;width:140px;height:10px}.bar i{display:block;height:10px;border-radius:4px;background:#7b5cff}
 .queue-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0 8px}.queue-actions{display:flex;gap:6px;flex-wrap:wrap}
 .queue-actions button{padding:7px 10px}.queue-actions button[data-action="remove"]{background:#403348}
-.failed{color:#ff6b6b}.done{color:#5be38a}
+.failed{color:#ff6b6b}.done{color:#5be38a}.deferred,.retry_wait{color:#cbb8ff}
 @media(max-width:520px){body{padding:16px}#selectionPanel,.settings{padding:12px}#selectionPanel{grid-template-columns:minmax(0,1fr)}.settings{grid-template-columns:minmax(0,1fr)}.settings label{align-items:flex-start}}
 @media(max-width:650px){#t table,#t tbody,#t tr,#t td{display:block;width:100%;min-width:0}#t thead{display:none}#t tr{padding:12px 0;border-bottom:1px solid #38344b}#t td{padding:6px 0;border:0;overflow-wrap:anywhere}#t td:first-child{font-weight:600}#t td:nth-child(4)::before{content:'Quality: '}#t .queue-actions{display:flex;flex-wrap:wrap;gap:6px}}
 

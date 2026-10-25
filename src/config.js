@@ -10,13 +10,13 @@ const defaults = {
   // Paste your own configured Torrentio URL here if you use a debrid service,
   // e.g. https://torrentio.strem.fun/realdebrid=YOURKEY
   torrentioUrl: 'https://torrentio.strem.fun',
-  concurrency: 2,
+  concurrency: 4,
   // "auto": require English dub for anime (kitsu ids), prefer it for everything else
   // "require": skip episodes with no dub found | "prefer" | "off"
   dubMode: 'auto',
   maxResolution: 0, // 0 = highest available, or e.g. 1080
   stallMinutes: 5,
-  metadataTimeoutSeconds: 30,
+  metadataTimeoutSeconds: 15,
 };
 
 let user = {};

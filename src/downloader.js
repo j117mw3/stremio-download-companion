@@ -1,5 +1,5 @@
 import {ExtraBudget,ConnectivityEvidence,compareSources,verifiedFileBytes,probeSelection,TEST_LIMIT,testStopped} from './source-testing.js';
-import {failure, prepareTorrent, selectFile, FileProgress, RETRY_DELAYS, SOURCE_FAILURES} from './transfer-state.js';
+import {failure, prepareTorrent, selectFile, FileProgress, RETRY_DELAYS, DEFERRED_RETRY_DELAYS, SOURCE_FAILURES} from './transfer-state.js';
 import {findExisting, verifyExisting, fingerprint} from './existing.js';
 import { finalize } from './finalize.js';
 import { ensureSpace } from './disk.js';
@@ -109,7 +109,23 @@ export class Downloader {
       this.store.write('jobs',this.jobs);
     }
     if(!Array.isArray(this.jobs))throw new Error('Saved queue is invalid; original database preserved');
-    for(const [index,job] of this.jobs.entries()){job.queueOrder=Number.isFinite(job.queueOrder)?job.queueOrder:index+1;this.queueSequence=Math.max(this.queueSequence,job.queueOrder);job.comparison=null;job.isProbe=false;if(['downloading','resolving','verifying'].includes(job.status))job.status='queued';}
+    let migrated=false;
+    for(const [index,job] of this.jobs.entries()){
+      job.queueOrder=Number.isFinite(job.queueOrder)?job.queueOrder:index+1;this.queueSequence=Math.max(this.queueSequence,job.queueOrder);job.comparison=null;job.isProbe=false;
+      if(job.status==='needs_attention'&&SOURCE_FAILURES.has(job.failureCode)){
+        job.status='deferred';job.retryRound=Math.max(RETRY_DELAYS.length,Number(job.retryRound)||0);job.deferredRetryRound=0;
+        job.nextRetryAt=this.now()+DEFERRED_RETRY_DELAYS[0];job.stage='Deferred retry scheduled';job.backgroundRetryActive=false;migrated=true;
+      }
+      if(job.status==='deferred'&&job.backgroundRetryActive){
+        job.backgroundRetryActive=false;job.nextRetryAt=Math.min(Number.isFinite(job.nextRetryAt)?job.nextRetryAt:this.now(),this.now());job.stage='Deferred retry waiting for ready work';migrated=true;
+      }
+      if(['downloading','resolving','verifying'].includes(job.status)){
+        if(job.backgroundRetryActive){job.status='deferred';job.backgroundRetryActive=false;job.nextRetryAt=Math.min(Number.isFinite(job.nextRetryAt)?job.nextRetryAt:this.now(),this.now());job.stage='Deferred retry waiting for ready work';}
+        else job.status='queued';
+        migrated=true;
+      }
+    }
+    if(migrated)this.save();
     this.pump();
   }
 
@@ -174,6 +190,10 @@ export class Downloader {
 
   sourceKey(source) {
     return createHash('sha256').update(JSON.stringify([source.infoHash,source.fileIdx,source.url,source.filename])).digest('hex');
+  }
+
+  turnIdentity(source) {
+    return source.infoHash?'torrent:'+String(source.infoHash).toLowerCase():'http:'+this.sourceKey(source);
   }
 
   historyKey(source) {
@@ -245,26 +265,36 @@ export class Downloader {
   defer(job,error) {
     job.failureCode=error.code;job.error=error.message;job.speed=0;job.torrentSpeed=0;
     const round=job.retryRound||0;
-    if(round>=RETRY_DELAYS.length){job.status='needs_attention';job.stage='Needs attention';job.nextRetryAt=null;}
-    else {job.status='retry_wait';job.stage='Retry scheduled';job.nextRetryAt=this.now()+RETRY_DELAYS[round];job.retryRound=round+1;}
+    job.backgroundRetryActive=false;
+    if(round>=RETRY_DELAYS.length){
+      const deferredRound=Math.max(0,Number(job.deferredRetryRound)||0),delay=DEFERRED_RETRY_DELAYS[Math.min(deferredRound,DEFERRED_RETRY_DELAYS.length-1)];
+      job.status='deferred';job.stage='Deferred retry scheduled';job.nextRetryAt=this.now()+delay;job.deferredRetryRound=deferredRound+1;
+    }else {job.status='retry_wait';job.stage='Retry scheduled';job.nextRetryAt=this.now()+RETRY_DELAYS[round];job.retryRound=round+1;}
   }
 
   pump() {
     clearTimeout(this.retryTimer);
     if(this.stopping||this.clearing)return;
     const now=this.now();this.extraBudget||=new ExtraBudget(2);
-    for(const job of this.jobs)if(job.status==='retry_wait'&&job.nextRetryAt<=now){job.status='queued';job.nextRetryAt=null;}
+    for(const job of this.jobs)if(job.status==='retry_wait'&&Number.isFinite(job.nextRetryAt)&&job.nextRetryAt<=now){job.status='queued';job.nextRetryAt=null;}
     const stalled=this.jobs.filter(j=>this.controllers.has(j.id)&&['downloading','resolving'].includes(j.status)&&now-(j.lastProgressAt??j.runStartedAt??now)>=30000);
     const canProbe=stalled.length>0&&!this.jobs.some(j=>j.isProbe&&this.controllers.has(j.id));
     const limit=cfg.concurrency+(canProbe?1:0);
     while (this.active < limit) {
       const queued=this.jobs.filter(j=>j.status==='queued'&&!this.controllers.has(j.id)).sort((a,b)=>(a.queueOrder??0)-(b.queueOrder??0));
       const probe=this.active>=cfg.concurrency;
-      const job = (probe&&stalled.length?queued.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||queued[0];
+      const activeDeferred=this.jobs.some(j=>j.backgroundRetryActive&&this.controllers.has(j.id));
+      let job=(probe&&stalled.length?queued.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||queued[0];
+      let deferred=false;
+      if(!job&&!probe&&this.active<cfg.concurrency&&!activeDeferred){
+        job=this.jobs.filter(j=>j.status==='deferred'&&!this.controllers.has(j.id)&&Number.isFinite(j.nextRetryAt)&&j.nextRetryAt<=now).sort((a,b)=>(a.nextRetryAt-b.nextRetryAt)||(a.queueOrder-b.queueOrder))[0];
+        deferred=!!job;
+      }
       if (!job) break;
       const releaseExtra=probe?this.extraBudget.tryAcquire():null;
       if(probe&&!releaseExtra)break;
       job.isProbe=probe;
+      if(deferred){job.backgroundRetryActive=true;job.nextRetryAt=null;job.stage='Deferred retry starting after ready work';}
       if(job.yieldedAt){job.yieldedAt=null;job.stage='Resuming after higher priority downloads';}
       this.active++;
       const task=this.run(job).finally(() => {
@@ -272,7 +302,7 @@ export class Downloader {
       });
       this.running.add(task);
     }
-    const due=this.jobs.filter(j=>j.status==='retry_wait').map(j=>j.nextRetryAt);
+    const due=this.jobs.filter(j=>['retry_wait','deferred'].includes(j.status)&&Number.isFinite(j.nextRetryAt)&&j.nextRetryAt>now).map(j=>j.nextRetryAt);
     const activeNetwork=this.jobs.some(j=>this.controllers.has(j.id)&&['downloading','resolving'].includes(j.status));
     if(due.length||activeNetwork){this.retryTimer=setTimeout(()=>this.pump(),Math.max(1,Math.min(activeNetwork?1000:Infinity,...due.map(time=>time-this.now()))));this.retryTimer.unref?.();}
   }
@@ -319,7 +349,12 @@ export class Downloader {
       streams=streams.filter(raw=>this.available(job,parseStream(raw)));
       const choiceOptions = { mode, connectivityScore:source=>this.connectivityScore(job,source), preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
       const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
-      const choose=sources=>pickBest(sources.filter(raw=>!job.recentSources?.includes(this.sourceKey(parseStream(raw)))),choiceOptions)||pickBest(sources,choiceOptions);
+      const attemptedSources=new Set();
+      const choose=sources=>{
+        const untried=sources.filter(raw=>!attemptedSources.has(this.turnIdentity(parseStream(raw))));
+        const fresh=untried.filter(raw=>!job.recentSources?.includes(this.sourceKey(parseStream(raw))));
+        return pickBest(fresh,choiceOptions)||pickBest(untried,choiceOptions);
+      };
       let choice = preferredSource&&!job.recentSources?.includes(this.sourceKey(parseStream(preferredSource))) ? pickBest([preferredSource], choiceOptions) : null;
       if (!choice) choice = choose(streams);
       if (!choice) throw failure(originalCount&&!streams.length?'SOURCE_COOLDOWN':'NO_SOURCES',originalCount&&!streams.length?'Sources are cooling down':mode==='require'?'No English dub found':'No streams found');
@@ -336,14 +371,15 @@ export class Downloader {
       const prefix = `S${pad(job.season)}E${pad(job.episode)} - `;
 
       job.attempts ||= [];
-      let candidates=0;
-      while(choice && candidates<3) {
-        candidates++;
+      while(choice) {
         controller.signal.throwIfAborted();
+        const identity=this.turnIdentity(choice);
+        if(!attemptedSources.has(identity)&&attemptedSources.size>=3)break;
+        attemptedSources.add(identity);
         job.speed=0;job.torrentSpeed=0;job.progress=0;
         job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';
         try {
-          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix);
+          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix,attemptedSources);
           if(choice.infoHash)hashes.add(choice.infoHash);
           break;
         }catch(e){
@@ -353,28 +389,28 @@ export class Downloader {
           job.recentSources=[...(job.recentSources||[]).filter(key=>key!==this.sourceKey(choice)),this.sourceKey(choice)].slice(-100);
           job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:1,code:e.code,error:e.message,time:this.now()});
           job.attempts=job.attempts.slice(-100);this.save();
-          if(e.code==='NO_USEFUL_PIECES'||e.code==='HTTP_STALL')throw e;
-          streams=streams.filter(raw=>raw!==choice.raw&&this.available(job,parseStream(raw)));
+          streams=streams.filter(raw=>this.turnIdentity(parseStream(raw))!==identity&&this.available(job,parseStream(raw)));
           const next=choose(streams);
-          if(!next||candidates>=3)throw e;
+          if(!next||(!attemptedSources.has(this.turnIdentity(next))&&attemptedSources.size>=3))throw e;
           choice=next;job.fallbackReason='Previous source failed';job.stage='Trying another source';
         }
       }
       if(job.verification?.resolution)job.quality=job.verification.resolution+'p';
-      job.retryRound=0;job.failureCode=null;job.nextRetryAt=null;job.torrentSpeed=0;
+      job.retryRound=0;job.deferredRetryRound=0;job.backgroundRetryActive=false;job.failureCode=null;job.nextRetryAt=null;job.torrentSpeed=0;
       job.stage='Complete';
       job.status = 'done';
       job.progress = 1;
       job.speed = 0;
     } catch (e) {
-      if(e.code==='YIELD_TRANSFER'&&!controller.signal.aborted){job.status='queued';job.yieldedAt=this.now();job.queueOrder=this.nextQueueOrder();job.stage='Waiting behind other downloads';job.error=null;job.failureCode=null;job.speed=0;}
+      if(e.code==='YIELD_TRANSFER'&&!controller.signal.aborted){job.status='queued';job.backgroundRetryActive=false;job.yieldedAt=this.now();job.queueOrder=this.nextQueueOrder();job.stage='Waiting behind other downloads';job.error=null;job.failureCode=null;job.speed=0;}
       else if (!['paused','cancelled','queued'].includes(job.status)){
         if(!controller.signal.aborted&&SOURCE_FAILURES.has(e.code))this.defer(job,e);
         else {job.status=e.code==='ENOSPC'?'paused':'failed';job.failureCode=e.code||'LOCAL_FAILURE';}
       }
+      if(controller.signal.aborted&&['paused','cancelled'].includes(job.status))job.backgroundRetryActive=false;
       job.error = e.code==='YIELD_TRANSFER'||controller.signal.aborted ? null : e.message;
       job.speed = 0;
-    } finally {job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;this.controllers.delete(job.id);}
+    } finally {job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;job.backgroundRetryActive=false;this.controllers.delete(job.id);}
   }
 
   startAttempt(parent,choice,probe,ownerSignal,dir,prefix) {
@@ -382,14 +418,14 @@ export class Downloader {
     const id=parent.id+'#'+this.sourceKey(choice)+'#'+Math.random().toString(16).slice(2);
     const controller=new AbortController();
     const signal=AbortSignal.any([ownerSignal,controller.signal]);
-    const job={...parent,id,ownerId:parent.ownerId||parent.id,comparison:null,progress:0,speed:0,rollingSpeed:0,lastProgressAt:null};
+    const job={...parent,id,ownerId:parent.ownerId||parent.id,comparison:null,progress:0,speed:0,rollingSpeed:0,lastProgressAt:null,sourceWaitStartedAt:this.now(),waitLimitSeconds:45,metadataWaitStartedAt:null,sourceResponseAt:null,dataStartedAt:null};
     this.controllers.set(id,{signal,abort:()=>controller.abort()});
     let adopt;
     const adoption=new Promise(resolve=>adopt=resolve);
     const attempt={job,choice,probe,started:this.now(),evidence:new ConnectivityEvidence(this.now()),cancel:()=>controller.abort(testStopped('Source test cancelled'))};
     const context={attempt,signal,adopted:!probe,bytes:0,previous:0,baseline:0,verifiedBaseline:0,started:this.now()};
     let connectTimer,totalTimer;
-    context.ready=()=>{attempt.evidence.ready=true;clearTimeout(connectTimer);};
+    context.ready=()=>{attempt.evidence.ready=true;attempt.job.sourceResponseAt=this.now();attempt.job.dataStartedAt=this.now();attempt.job.metadataWaitStartedAt=null;clearTimeout(connectTimer);};
     context.observe=(bytes,verified=0,complete=false,video=false)=>{
       context.bytes+=Math.max(0,bytes-context.previous);context.previous=bytes;
       attempt.evidence.update(context.bytes,Math.max(0,verified-context.verifiedBaseline),this.now(),{complete,video});
@@ -411,31 +447,32 @@ export class Downloader {
     return attempt;
   }
 
-  async downloadWithComparison(job,choice,streams,options,dir,prefix) {
+  async downloadWithComparison(job,choice,streams,options,dir,prefix,attemptedSources=new Set()) {
     this.extraBudget||=new ExtraBudget(2);this.sourceResults||={};
     const candidates=[];const seen=new Set([choice.url?'url:'+choice.url:'torrent:'+choice.infoHash]);
     let remaining=streams.filter(raw=>this.available(job,parseStream(raw)));
-    while(remaining.length&&candidates.length<2){
+    while(remaining.length&&candidates.length<Math.min(2,Math.max(0,3-attemptedSources.size))){
       const target=remaining.filter(raw=>parseStream(raw).res===job.profile?.resolution);
       const selected=pickBest(target,options)||pickBest(remaining,options);if(!selected)break;
       remaining=remaining.filter(raw=>raw!==selected.raw);
       const identity=selected.url?'url:'+selected.url:'torrent:'+selected.infoHash;
-      if(seen.has(identity)||!selected.res)continue;seen.add(identity);candidates.push(selected);
+      if(seen.has(identity)||!selected.res||attemptedSources.has(this.turnIdentity(selected)))continue;seen.add(identity);candidates.push(selected);
     }
     const signal=this.controllers.get(job.id).signal;
     const sync=attempt=>{
-      for(const key of ['progress','speed','rollingSpeed','torrentSpeed','peers','downloadedBytes','idleSeconds','lastProgressAt','stage','totalBytes'])job[key]=attempt.job[key];
+      for(const key of ['progress','speed','rollingSpeed','torrentSpeed','peers','downloadedBytes','idleSeconds','lastProgressAt','stage','totalBytes','sourceWaitStartedAt','waitLimitSeconds','metadataWaitStartedAt','sourceResponseAt','dataStartedAt'])job[key]=attempt.job[key];
     };
     const tested=[];
     const result=await compareSources({signal,primary:choice,candidates,budget:this.extraBudget,now:()=>this.now(),
       start:(source,probe,owner)=>{
+        if(probe)attemptedSources.add(this.turnIdentity(source));
         const attempt=this.startAttempt(job,source,probe,owner,dir,prefix);
         if(probe)tested.push(attempt);
         return attempt;
       },
       onView:(phase,attempt)=>{
         if(!attempt.probe)sync(attempt);
-        job.comparison=phase==='testing'?{status:'testing',primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now())}))}:null;
+        job.comparison=phase==='testing'?{status:'testing',startedAt:tested[0]?.started||this.now(),elapsedSeconds:Math.floor((this.now()-(tested[0]?.started||this.now()))/1000),limitSeconds:30,primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,elapsedSeconds:Math.floor((this.now()-test.started)/1000),limitSeconds:30,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now())}))}:null;
         if(phase==='testing')job.stage='Checking for a faster source';
         if(phase==='switching'){job.release=attempt.choice.title;job.sourceProviders=attempt.choice.addonNames||[];job.quality=attempt.choice.res?attempt.choice.res+'p':'?';job.stage='Switching to a verified working source';job.switchNote='Different release selected; percentage reflects this release. Previous partial download retained.';}
       },
@@ -554,12 +591,13 @@ export class Downloader {
       const magnet = `magnet:?xt=urn:btih:${c.infoHash}` + trackers.map((t) => `&tr=${encodeURIComponent(t)}`).join('');
       const cached=readCachedTorrent(e.metainfo,c.infoHash);
       e.promise = new Promise((resolve, reject) => {
+        const metadataTimeout=Math.min(15,Number(cfg.metadataTimeoutSeconds)||15);
+        const timer = setTimeout(() => reject(failure('METADATA_TIMEOUT','Timed out fetching torrent metadata from peers')), metadataTimeout * 1000);
+        e.cleanup=()=>clearTimeout(timer);
         this.getClient().then(client=>{
         if(this.torrents.get(c.infoHash)!==e)throw failure('STOPPED','Stopped');
         const t = client.add(cached||magnet, { path: e.tmp });
         e.torrent = t;
-        const timer = setTimeout(() => reject(failure('METADATA_TIMEOUT','Timed out fetching torrent metadata from peers')), cfg.metadataTimeoutSeconds * 1000);
-        e.cleanup=()=>clearTimeout(timer);
         t.on('metadata',()=>cacheTorrent(e.metainfo,t));
         t.on('error', (err) => {
           clearTimeout(timer);
@@ -603,11 +641,13 @@ export class Downloader {
 
   async downloadTorrent(job, c, dir, prefix) {
     job.speed=0;job.torrentSpeed=0;job.stage='Finding torrent metadata';
+    job.metadataWaitStartedAt=this.now();
     job.peers=0;
     const peerMonitor=setInterval(()=>{job.peers=this.torrents.get(c.infoHash)?.torrent?.numPeers||0;},1000);
     let e;
     try { e = await this.acquire(c,this.controllers.get(job.id)?.signal); }
     finally { clearInterval(peerMonitor); }
+    job.metadataWaitStartedAt=null;job.sourceResponseAt=this.now();
     job.peers=e.torrent?.numPeers||0;
     job.stage='Downloading video';
     let unselect,windowSelection;
@@ -644,7 +684,7 @@ export class Downloader {
           if(sample.speed>0)job.lastProgressAt=this.now();
           job.stage=sample.idleMs>=1000?'Waiting for useful pieces':'Downloading video';
           if(file.progress>=1&&(!t.bitfield||verified>=file.length))return finish();
-          if(sample.idleMs>=90000)finish(failure('NO_USEFUL_PIECES','Stalled: connected peers sent no usable pieces'));
+          if(sample.idleMs>=45000)finish(failure('NO_USEFUL_PIECES','No verified episode data within 45 seconds'));
         };
         t.on('error',onError);signal?.addEventListener('abort',abort,{once:true});
         iv=setInterval(poll,1000);poll();
@@ -667,8 +707,8 @@ export class Downloader {
   control(id, action) {
     if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
     const job=this.jobs.find(j=>j.id===id);if(!job) throw new Error("Unknown job");
-    if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";job.yieldedAt=null;job.nextRetryAt=null;job.speed=0;job.torrentSpeed=0;this.controllers.get(id)?.abort();}
-    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done"){job.status="queued";job.yieldedAt=null;job.queueOrder=this.nextQueueOrder();job.retryRound=0;job.nextRetryAt=null;job.failureCode=null;job.recentSources=[];for(const key of Object.keys(this.cooldowns||{}))if(key.startsWith(job.id+'|'))delete this.cooldowns[key];}}
+    if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";job.backgroundRetryActive=false;job.yieldedAt=null;job.nextRetryAt=null;job.speed=0;job.torrentSpeed=0;this.controllers.get(id)?.abort();}
+    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done"){job.status="queued";job.backgroundRetryActive=false;job.yieldedAt=null;job.queueOrder=this.nextQueueOrder();job.retryRound=0;job.deferredRetryRound=0;job.nextRetryAt=null;job.failureCode=null;job.recentSources=[];for(const key of Object.keys(this.cooldowns||{}))if(key.startsWith(job.id+'|'))delete this.cooldowns[key];}}
     else throw new Error("Unknown action");
     this.save();this.pump();
   }
