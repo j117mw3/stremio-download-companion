@@ -54,7 +54,25 @@ export function probeSelection(entry,file){
 export const TEST_LIMIT=16*1024*1024;
 export const MAX_SOURCE_TURN_SOURCES=5;
 export const SOURCE_TURN_LIMIT_MS=60_000;
-export const testStopped=reason=>failure('TEST_INCONCLUSIVE',reason);
+export const testStopped=(reason,reasonCode='test_inconclusive')=>Object.assign(failure('TEST_INCONCLUSIVE',reason),{reasonCode});
+
+function outcomeReason(candidate,code,mode,recovered){
+  if(recovered)return 'original_recovered';
+  if(code==='METADATA_TIMEOUT')return 'metadata_timeout';
+  if(code==='NO_USEFUL_PIECES')return 'no_verified_episode_bytes';
+  if(code==='HTTP_STALL')return 'http_payload_stall';
+  if(code==='TEST_INCONCLUSIVE'){
+    const explicit=candidate.result?.error?.reasonCode;
+    if(explicit==='time_cap'&&candidate.choice.infoHash&&candidate.evidence.ready&&Number(candidate.job?.peers)===0)return 'no_peers';
+    if(explicit&&explicit!=='test_inconclusive')return explicit;
+    if(!candidate.evidence.ready&&candidate.choice.infoHash)return 'metadata_timeout';
+    if(candidate.choice.infoHash&&Number(candidate.job?.peers)===0)return 'no_peers';
+    return mode==='slow'?'time_cap':'test_inconclusive';
+  }
+  if(code==='VERIFY_UNAVAILABLE'||code==='ENOSPC')return 'verification_failure';
+  if(code)return String(code).toLowerCase().replace(/[^a-z0-9_]+/g,'_');
+  return 'working';
+}
 
 // The shared budget admits waiting first candidates before second candidates.
 // Up to two alternatives may run together when capacity is available.
@@ -78,14 +96,14 @@ export async function compareSources({signal,primary,candidates,getCandidates=nu
   const terminalFailure=()=>original.result?.error&&original.result.error.code!=='TEST_INCONCLUSIVE'?original.result.error:makeFailure();
   const test=async(limitMs,mode)=>{
     const session=new AbortController();const testSignal=AbortSignal.any([combined,session.signal]);
-    const comparisonTimer=setTimeout(()=>session.abort(testStopped('Source comparison time limit reached')),Math.max(0,limitMs));
+    const comparisonTimer=setTimeout(()=>session.abort(testStopped('Source comparison time limit reached','time_cap')),Math.max(0,limitMs));
     let pool=new Set(),finished=0,workerError=null,adoptedWinner=false;
     const report=(choice,candidate)=>{
       if(candidate.reported||!candidate.result)return;
       candidate.reported=true;
       const qualifies=candidate.evidence.qualifies(!!choice.infoHash),code=candidate.result.error?.code||null;
       const status=code==='TEST_INCONCLUSIVE'?(qualifies?'working':'inconclusive'):['ENOSPC','VERIFY_UNAVAILABLE','METADATA_TIMEOUT','HTTP_STALL'].includes(code)?'inconclusive':code?'failed':'working';
-      onResult(choice,{status,bytes:candidate.evidence.bytes,verifiedBytes:candidate.evidence.verified,speed:candidate.evidence.score(now()),code});
+      onResult(choice,{status,bytes:candidate.evidence.bytes,verifiedBytes:candidate.evidence.verified,speed:candidate.evidence.score(now()),code,reasonCode:outcomeReason(candidate,code,mode,recovered())});
     };
     const runCandidate=async(choice,index)=>{
       let release,candidate;
@@ -100,7 +118,17 @@ export async function compareSources({signal,primary,candidates,getCandidates=nu
         }
       }catch(error){if(!testSignal.aborted)workerError=error;}
       finally{
-        if(candidate&&candidate!==adopted){candidate.cancel();await candidate.promise.catch(()=>{});active.delete(candidate);}
+        if(candidate&&candidate!==adopted){
+          if(!candidate.result){
+            const primaryFinished=!!original.result&&!original.result.error;
+            const reason=recovered()||primaryFinished?testStopped('Original source remained usable','original_recovered'):
+              adopted!==original?testStopped('Another source was selected','cancelled'):
+              testSignal.aborted?(testSignal.reason?.reasonCode?testSignal.reason:testStopped('Source comparison was cancelled','cancelled')):
+              testStopped('Candidate sampling ended','time_cap');
+            candidate.cancel(reason);
+          }
+          await candidate.promise.catch(()=>{});active.delete(candidate);
+        }
         if(candidate)report(choice,candidate);
         pool.delete(candidate);release?.();finished++;
       }

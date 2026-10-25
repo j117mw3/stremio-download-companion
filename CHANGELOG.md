@@ -81,3 +81,10 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Retry up to four due deferred episodes in available normal slots after queued work drains, rotating fairly across shows while keeping fresh work first.
 - Recover the requested episode by a unique filename or episode tag when a provider's torrent file index points at another episode; reject ambiguous matches.
 - Expose concise add-on lookup progress in the queue and preserve existing request formats, source limits, quality rules, and media verification.
+
+## 0.4.15
+
+- Yield slow transfers to due deferred retries as well as fresh work; resume yielded episodes in order after higher-priority work drains, preserving their partial files and manual pauses.
+- Back off Stremio add-ons that repeatedly fail: 30 minutes for persistent client errors and 5 minutes with exponential growth up to 30 minutes for timeouts, network errors, and server errors. Successful or empty responses clear provider backoff; expired providers are retried.
+- Record typed source-test outcomes and expose privacy-safe hourly diagnostic summaries retained for 14 days through `/api/diagnostics/sources`.
+- After finalizing a torrent download, compare SHA-256 fingerprints of the staged source and final file; remove only that verified staged file after all active references to its torrent have ended.

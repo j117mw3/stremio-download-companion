@@ -152,10 +152,13 @@ function mergeStreams(collected){
  * The lookup retains the older all-results promise API through getStreams(). */
 export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{},providerHistory={},providers:providedProviders,pool=providerRequestPool,timeoutMs=PROVIDER_TIMEOUT_MS,workersPerEpisode=PROVIDER_WORKERS_PER_EPISODE,now=Date.now}={}){
   const nowFn=typeof now==='function'?now:()=>now;
-  const providers=(providedProviders||streamProviders()).map(addon=>({...addon,names:addon.names||[addon.name].filter(Boolean),id:addon.id||providerIdentifier(addon)}))
+  const allProviders=(providedProviders||streamProviders()).map(addon=>({...addon,names:addon.names||[addon.name].filter(Boolean),id:addon.id||providerIdentifier(addon)}));
+  // Skip providers during their expiring backoff. If every provider is cooling
+  // down this lookup returns promptly; a later retry after expiry probes them.
+  const providers=allProviders.filter(provider=>(Number(providerHistory?.[provider.id]?.cooldownUntil)||0)<=nowFn())
     .sort((a,b)=>providerPriority(b,providerHistory,nowFn())-providerPriority(a,providerHistory,nowFn()));
   const collected=[],diagnostics=[],changeListeners=new Set();let cursor=0,completed=0,done=false;
-  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length,elapsedMs:Math.max(0,nowFn()-started),done});
+  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length,suppressedCount:allProviders.length-providers.length,elapsedMs:Math.max(0,nowFn()-started),done});
   const publish=()=>{try{onUpdate(snapshot());}catch{}for(const listener of [...changeListeners])listener();};
   const started=nowFn();
   const worker=async()=>{

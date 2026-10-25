@@ -20,6 +20,7 @@ const safe = (s) => String(s).replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+
 const VIDEO_EXT = /\.(mkv|mp4|avi|webm|mov|m4v|ts)$/i;
 const MIB=1024*1024;
 const LOW_RATE=MIB*.25;
+const SAFE_PROVIDER_CATEGORY=value=>/^(?:ok|empty|timeout|network_error|invalid_response|http_[1-5]\d\d)$/.test(String(value||''))?String(value):'other';
 
 function readCachedTorrent(file, expectedHash) {
   try {
@@ -170,7 +171,14 @@ export class Downloader {
     const now=this.now(),previous=this.providerResults?.[record.providerId]||{};
     const responsive=['ok','empty'].includes(record.status);
     this.providerResults||={};
-    this.providerResults[record.providerId]={responsive,latencyMs:record.latencyMs,responseAt:now,cooldownUntil:responsive?0:now+5*60000,usefulRate:previous.usefulAt>now-30*60000?previous.usefulRate||0:0,usefulAt:previous.usefulAt||0,expires:now+30*60000};
+    const category=SAFE_PROVIDER_CATEGORY(record.category||record.status);
+    const persistentClientError=/^http_4\d\d$/.test(category)&&category!=='http_429';
+    const failureClass=responsive?null:persistentClientError?'client':'transient';
+    const previousStreak=previous.failureClass===failureClass?Number(previous.failureStreak)||0:0;
+    const failureStreak=responsive?0:persistentClientError?1:Math.min(16,previousStreak+1);
+    const cooldownMs=responsive?0:persistentClientError?30*60000:Math.min(30*60000,5*60000*2**Math.max(0,failureStreak-1));
+    const hasRecentRate=Number(previous.usefulAt)>now-30*60000;
+    this.providerResults[record.providerId]={responsive,status:record.status,category,latencyMs:record.latencyMs,responseAt:now,failureClass,failureStreak,cooldownUntil:responsive?0:now+cooldownMs,usefulRate:hasRecentRate?previous.usefulRate||0:0,usefulAt:hasRecentRate?previous.usefulAt:0,expires:now+Math.max(30*60000,cooldownMs)};
     this.sourceDiagnostics?.record({event:'provider_response',time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),providerId:record.providerId,status:record.status,category:record.category,latencyMs:record.latencyMs,resultCount:record.resultCount});
     this.save();
   }
@@ -178,7 +186,7 @@ export class Downloader {
   recordSourceDiagnostic(job,source,event,outcome={}){
     const now=this.now(),providerIds=Array.isArray(source?.providerIds)?source.providerIds:[];
     const status=outcome.status||'working';
-    const category=String(outcome.code||'').toLowerCase()||status;
+    const category=this.sourceOutcomeCategory(outcome,status);
     const releaseId=this.historyKey(source);
     for(const providerId of providerIds){
       this.sourceDiagnostics?.record({event,time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),providerId,releaseId,status,category,quality:source.res||0,bytes:outcome.bytes,verifiedBytes:outcome.verifiedBytes,rate:outcome.speed});
@@ -187,10 +195,20 @@ export class Downloader {
         this.providerResults[providerId]={...previous,usefulRate:Math.max(Number(previous.usefulRate)||0,Number(outcome.speed)||0),usefulAt:now,expires:now+30*60000};
       }
     }
-    if(event==='source_selected'&&!providerIds.length)this.sourceDiagnostics?.record({event,time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),releaseId,quality:source.res||0});
+    if(!providerIds.length)this.sourceDiagnostics?.record({event,time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),releaseId,status,category,quality:source.res||0,bytes:outcome.bytes,verifiedBytes:outcome.verifiedBytes,rate:outcome.speed});
+  }
+
+  sourceOutcomeCategory(outcome,status){
+    if(outcome.reasonCode)return String(outcome.reasonCode).toLowerCase();
+    const code=String(outcome.code||'').toUpperCase();
+    const mapped={METADATA_TIMEOUT:'metadata_timeout',NO_USEFUL_PIECES:'no_verified_episode_bytes',HTTP_STALL:'http_payload_stall',TEST_INCONCLUSIVE:'test_inconclusive',SOURCE_FILE:'source_file',SOURCE_MEDIA:'source_media',VERIFY_UNAVAILABLE:'verification_failure',FINALIZE_VERIFY_FAILED:'verification_failure',ENOSPC:'verification_failure',HTTP_FAILURE:'http_failure',HTTP_INCOMPLETE:'http_incomplete',HTTP_RESUME:'http_resume'};
+    if(mapped[code])return mapped[code];
+    if(/^HTTP_\d{3}$/.test(code))return code.toLowerCase();
+    return String(status||'other').toLowerCase();
   }
 
   getSourceDiagnostics(limit=100){return this.sourceDiagnostics?.list(limit)||[];}
+  getSourceDiagnosticSummary(){return this.sourceDiagnostics?.hourlySummary()||[];}
 
   /** Queue episodes. Active entries are retained; completed files are rechecked before reuse. */
   enqueue({ kind, series, seriesName, episodes, profile = {} }) {
@@ -305,7 +323,11 @@ export class Downloader {
   }
 
   hasReadyWork(exceptId) {
-    return (this.jobs||[]).some(job=>job.id!==exceptId&&job.status==='queued'&&!this.controllers.has(job.id));
+    const now=this.now();
+    return (this.jobs||[]).some(job=>job.id!==exceptId&&!this.controllers.has(job.id)&&(
+      job.status==='queued'&&!job.yieldedAt||
+      ['deferred','retry_wait'].includes(job.status)&&Number.isFinite(job.nextRetryAt)&&job.nextRetryAt<=now
+    ));
   }
 
   cool(job,source,error) {
@@ -352,13 +374,15 @@ export class Downloader {
     const limit=cfg.concurrency+(canProbe?1:0);
     while (this.active < limit) {
       const queued=this.jobs.filter(j=>j.status==='queued'&&!this.controllers.has(j.id)).sort((a,b)=>(a.queueOrder??0)-(b.queueOrder??0));
+      const fresh=queued.filter(j=>!j.yieldedAt);
       const probe=this.active>=cfg.concurrency;
-      let job=(probe&&stalled.length?queued.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||queued[0];
+      let job=probe?(stalled.length?fresh.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||fresh[0]:fresh[0];
       let deferred=false;
       if(!job&&!probe&&this.active<cfg.concurrency){
         job=this.nextDeferredJob(now);
         deferred=!!job;
       }
+      if(!job&&!probe)job=queued.filter(j=>j.yieldedAt).sort((a,b)=>(a.yieldedAt-b.yieldedAt)||((a.queueOrder??0)-(b.queueOrder??0)))[0]||null;
       if (!job) break;
       const releaseExtra=probe?this.extraBudget.tryAcquire():null;
       if(probe&&!releaseExtra)break;
@@ -417,19 +441,21 @@ export class Downloader {
       const attemptedSources=new Set();
       const sourceTurnStartedAt=this.now(),sourceTurnDeadline=sourceTurnStartedAt+SOURCE_TURN_LIMIT_MS;
       job.sourceSearch={startedAt:sourceTurnStartedAt,deadlineAt:sourceTurnDeadline,elapsedSeconds:0,limitSeconds:SOURCE_TURN_LIMIT_MS/1000,attempted:0,maxSources:MAX_SOURCE_TURN_SOURCES,phase:'searching'};
-      let streams=[],lookupComplete=false,lookupError=null;
+      let streams=[],lookupComplete=false,lookupError=null,discoveryReceived=false;
       lookupController=new AbortController();
       const lookupSignal=AbortSignal.any([controller.signal,lookupController.signal]);
       const feedWaiters=new Set();
       const wakeFeed=()=>{for(const resolve of [...feedWaiters])resolve();};
       const waitForFeed=(ms=100)=>new Promise(resolve=>{let settled=false;const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);feedWaiters.delete(finish);resolve();};const timer=setTimeout(finish,Math.max(1,ms));feedWaiters.add(finish);});
       const updateDiscovery=snapshot=>{
+        discoveryReceived=true;
         if(Array.isArray(snapshot?.streams))streams=snapshot.streams;
         const records=Array.isArray(snapshot?.diagnostics)?snapshot.diagnostics:[];
         job.sourceDiscovery={
           phase:snapshot?.done?'complete':'searching',startedAt:sourceTurnStartedAt,
           elapsedSeconds:Math.max(0,Math.floor((this.now()-sourceTurnStartedAt)/1000)),
           providerCount:Number(snapshot?.providerCount)||0,completed:Number(snapshot?.completed)||0,
+          suppressedCount:Number(snapshot?.suppressedCount)||0,
           responsive:records.filter(record=>['ok','empty'].includes(record.status)).length,
           empty:records.filter(record=>record.status==='empty').length,
           timeouts:records.filter(record=>record.status==='timeout').length,
@@ -443,7 +469,7 @@ export class Downloader {
         onUpdate:updateDiscovery,
         onProvider:record=>this.recordProviderResponse(job,record),
       })).then(result=>{
-        if(Array.isArray(result)){streams=result;if(!job.sourceDiscovery||!job.sourceDiscovery.providerCount)updateDiscovery({streams,diagnostics:[],completed:0,providerCount:0,done:true});}
+        if(Array.isArray(result)){streams=result;if(!discoveryReceived)updateDiscovery({streams,diagnostics:[],completed:0,providerCount:0,suppressedCount:0,done:true});}
         lookupComplete=true;wakeFeed();return streams;
       },error=>{
         lookupError=error;lookupComplete=true;
@@ -506,6 +532,8 @@ export class Downloader {
           sourceTurnFailure=e;
           if(e.sourceChoice)choice=e.sourceChoice;
           if(controller.signal.aborted||!SOURCE_FAILURES.has(e.code))throw e;
+          const reasonCode=e.code==='NO_USEFUL_PIECES'&&!choice.url&&Number(job.peers)===0?'no_peers':this.sourceOutcomeCategory({code:e.code},'failed');
+          this.recordSourceResult(job,choice,{status:'failed',code:e.code,reasonCode,completedAt:this.now()});
           if(!job.sourceSearch.lastCode||job.sourceSearch.lastCode!==e.code)job.sourceSearch.lastCode=e.code;
           this.cool(job,choice,e);
           job.recentSources=[...(job.recentSources||[]).filter(key=>key!==this.sourceKey(choice)),this.sourceKey(choice)].slice(-100);
@@ -554,14 +582,14 @@ export class Downloader {
     this.controllers.set(id,{signal,abort:()=>controller.abort()});
     let adopt;
     const adoption=new Promise(resolve=>adopt=resolve);
-    const attempt={job,choice,probe,started:this.now(),evidence:new ConnectivityEvidence(this.now()),cancel:()=>controller.abort(testStopped('Source test cancelled'))};
+    const attempt={job,choice,probe,started:this.now(),evidence:new ConnectivityEvidence(this.now()),cancel:reason=>controller.abort(reason||testStopped('Source test cancelled','cancelled'))};
     const context={attempt,signal,adopted:!probe,bytes:0,previous:0,baseline:0,verifiedBaseline:0,started:this.now()};
     let connectTimer,totalTimer;
     context.ready=()=>{attempt.evidence.ready=true;attempt.job.sourceResponseAt=this.now();attempt.job.dataStartedAt=this.now();attempt.job.metadataWaitStartedAt=null;clearTimeout(connectTimer);};
     context.observe=(bytes,verified=0,complete=false,video=false)=>{
       context.bytes+=Math.max(0,bytes-context.previous);context.previous=bytes;
       attempt.evidence.update(context.bytes,Math.max(0,verified-context.verifiedBaseline),this.now(),{complete,video});
-      if(probe&&!context.adopted&&context.bytes>=TEST_LIMIT){context.capped=true;attempt.evidence.cappedAt??=this.now();if(!attempt.evidence.qualifies(!!choice.infoHash))controller.abort(testStopped('Source test reached its traffic limit'));}
+      if(probe&&!context.adopted&&context.bytes>=TEST_LIMIT){context.capped=true;attempt.evidence.cappedAt??=this.now();if(!attempt.evidence.qualifies(!!choice.infoHash))controller.abort(testStopped('Source test reached its traffic limit','traffic_cap'));}
     };
     context.beforeFinalize=async()=>{
       if(context.adopted)return;
@@ -573,7 +601,7 @@ export class Downloader {
       signal.throwIfAborted();
     };
     attempt.promote=()=>{attempt.probe=false;context.adopted=true;clearTimeout(connectTimer);clearTimeout(totalTimer);adopt();};
-    if(probe){connectTimer=setTimeout(()=>controller.abort(testStopped('Source test connection deadline reached')),15000);totalTimer=setTimeout(()=>controller.abort(testStopped('Source test time limit reached')),30000);}
+    if(probe){connectTimer=setTimeout(()=>controller.abort(testStopped('Source test connection deadline reached',choice.infoHash?'metadata_timeout':'http_payload_stall')),15000);totalTimer=setTimeout(()=>controller.abort(testStopped('Source test time limit reached','time_cap')),30000);}
     this.contexts.set(id,context);
     attempt.promise=(choice.url?this.downloadHttp(job,choice,dir,prefix):this.downloadTorrent(job,choice,dir,prefix)).finally(()=>{clearTimeout(connectTimer);clearTimeout(totalTimer);this.controllers.delete(id);this.contexts.delete(id);});
     return attempt;
@@ -620,7 +648,7 @@ export class Downloader {
         if(phase==='testing'&&comparisonMode==='idle'&&job.sourceSearch)job.sourceSearch.phase='searching';
         if(job.sourceSearch){job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);job.sourceSearch.attempted=attemptedSources.size;}
         const comparisonLimit=comparisonMode==='slow'||sourceTurnDeadline===null?30:Math.max(0,Math.ceil((sourceTurnDeadline-(tested[0]?.started||this.now()))/1000));
-        job.comparison=phase==='testing'?{status:'testing',startedAt:tested[0]?.started||this.now(),elapsedSeconds:Math.floor((this.now()-(tested[0]?.started||this.now()))/1000),limitSeconds:comparisonLimit,primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,elapsedSeconds:Math.floor((this.now()-test.started)/1000),limitSeconds:30,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now())}))}:null;
+        job.comparison=phase==='testing'?{status:'testing',startedAt:tested[0]?.started||this.now(),elapsedSeconds:Math.floor((this.now()-(tested[0]?.started||this.now()))/1000),limitSeconds:comparisonLimit,primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,elapsedSeconds:Math.floor((this.now()-test.started)/1000),limitSeconds:30,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now()),reasonCode:test.result?.error?.reasonCode||null}))}:null;
         if(phase==='testing')job.stage='Checking for a faster source';
         if(phase==='switching'){job.release=attempt.choice.title;job.sourceProviders=attempt.choice.addonNames||[];job.quality=attempt.choice.res?attempt.choice.res+'p':'?';job.stage='Switching to a verified working source';job.switchNote='Different release selected; percentage reflects this release. Previous partial download retained.';}
       },
@@ -661,6 +689,16 @@ export class Downloader {
       delete records[job.replacement.path];records[destination]=checked;this.store?.write('verifiedFiles',records);
       job.replacement=null;
     }else{signal?.throwIfAborted();finalize(source,destination);}
+  }
+
+  async stageVerifiedCleanup(entry,source,destination,signal){
+    const root=path.resolve(entry.tmp),staged=path.resolve(source),relative=path.relative(root,staged);
+    if(!relative||relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative))throw failure('FINALIZE_VERIFY_FAILED','Staged file is outside its torrent cache');
+    if(!fs.lstatSync(staged).isFile()||!fs.lstatSync(destination).isFile())throw failure('FINALIZE_VERIFY_FAILED','Finalized torrent files are not regular files');
+    signal?.throwIfAborted();
+    const [sourceStamp,destinationStamp]=await Promise.all([fingerprint(staged,signal),fingerprint(destination,signal)]);
+    if(sourceStamp.hash!==destinationStamp.hash)throw failure('FINALIZE_VERIFY_FAILED','Final copy did not match the verified torrent file');
+    entry.cleanupFiles||=new Set();entry.cleanupFiles.add(staged);
   }
 
   // ---- direct (debrid) links, resumable via HTTP Range ----
@@ -788,7 +826,13 @@ export class Downloader {
     } catch {
       /* already gone */
     }
-    // Keep verified pieces for restart recovery.
+    // Remove only files whose final destination was byte-verified after copy.
+    // Failed or still-shared torrents retain every staged partial.
+    for(const staged of e.cleanupFiles||[]){
+      const relative=path.relative(path.resolve(e.tmp),path.resolve(staged));
+      if(!relative||relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative))continue;
+      try{if(fs.lstatSync(staged).isFile())fs.unlinkSync(staged);}catch{}
+    }
   }
 
   async downloadTorrent(job, c, dir, prefix) {
@@ -852,6 +896,7 @@ export class Downloader {
       job.verification=await this.checkMedia(src,{english:!!job.profile?.english,maxResolution:job.profile?.resolution,allowedResolutions:job.profile?.allowedResolutions,signal:this.controllers.get(job.id)?.signal});
       this.controllers.get(job.id)?.signal.throwIfAborted();
       await this.finishFile(job,src,dest);
+      await this.stageVerifiedCleanup(e,src,dest,this.controllers.get(job.id)?.signal);
       return dest;
     } finally {
       windowSelection?.release();unselect?.();
