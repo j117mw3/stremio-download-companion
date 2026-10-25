@@ -176,9 +176,20 @@ export class Downloader {
     const failureClass=responsive?null:persistentClientError?'client':'transient';
     const previousStreak=previous.failureClass===failureClass?Number(previous.failureStreak)||0:0;
     const failureStreak=responsive?0:persistentClientError?1:Math.min(16,previousStreak+1);
-    const cooldownMs=responsive?0:persistentClientError?30*60000:Math.min(30*60000,5*60000*2**Math.max(0,failureStreak-1));
+    const baseCooldownMs=responsive?0:persistentClientError?30*60000:Math.min(30*60000,5*60000*2**Math.max(0,failureStreak-1));
+    const retryAfterMs=category==='http_429'?Math.min(2*60*60*1000,Math.max(0,Number(record.retryAfterMs)||0)):0;
+    const cooldownMs=Math.max(baseCooldownMs,retryAfterMs);
     const hasRecentRate=Number(previous.usefulAt)>now-30*60000;
-    this.providerResults[record.providerId]={responsive,status:record.status,category,latencyMs:record.latencyMs,responseAt:now,failureClass,failureStreak,cooldownUntil:responsive?0:now+cooldownMs,usefulRate:hasRecentRate?previous.usefulRate||0:0,usefulAt:hasRecentRate?previous.usefulAt:0,expires:now+Math.max(30*60000,cooldownMs)};
+    this.providerResults[record.providerId]={responsive,status:record.status,category,originId:record.originId,latencyMs:record.latencyMs,responseAt:now,failureClass,failureStreak,cooldownUntil:responsive?0:now+cooldownMs,usefulRate:hasRecentRate?previous.usefulRate||0:0,usefulAt:hasRecentRate?previous.usefulAt:0,expires:now+Math.max(30*60000,cooldownMs)};
+    if(record.originId&&category==='http_429'){
+      const oldOrigin=this.providerResults[record.originId]||{},originStreak=oldOrigin.failureClass==='transient'?Number(oldOrigin.failureStreak)||0:0;
+      const originFailureStreak=Math.min(16,originStreak+1),originBackoff=Math.min(30*60000,5*60000*2**Math.max(0,originFailureStreak-1));
+      const originCooldown=Math.max(originBackoff,retryAfterMs);
+      this.providerResults[record.originId]={responsive:false,status:'http_error',category:'http_429',responseAt:now,failureClass:'transient',failureStreak:originFailureStreak,cooldownUntil:now+originCooldown,expires:now+Math.max(30*60000,originCooldown)};
+    }else if(record.originId&&responsive){
+      const oldOrigin=this.providerResults[record.originId]||{};
+      if(!(Number(oldOrigin.cooldownUntil)>now))this.providerResults[record.originId]={...oldOrigin,responsive:true,status:record.status,category,responseAt:now,failureClass:null,failureStreak:0,cooldownUntil:0,expires:now+30*60000};
+    }
     this.sourceDiagnostics?.record({event:'provider_response',time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),providerId:record.providerId,status:record.status,category:record.category,latencyMs:record.latencyMs,resultCount:record.resultCount});
     this.save();
   }
@@ -432,7 +443,7 @@ export class Downloader {
         }
       }
       job.status='resolving';
-      const mode = job.profile?.english ? "require" : job.profile ? "off" : effectiveDubMode(job.kind);
+      const mode = job.profile?.english ? "prefer" : job.profile ? "off" : effectiveDubMode(job.kind);
       const key = `${job.series}|${job.season}`;
       if (!this.seasonHashes.has(key)) this.seasonHashes.set(key, new Set());
       const hashes = this.seasonHashes.get(key);
@@ -499,7 +510,9 @@ export class Downloader {
       if(!choice){
         const originalCount=streams.length;
         if(lookupError&&!originalCount)throw failure('PROVIDER_FAILURE','Provider lookup did not return a usable response');
-        throw failure(originalCount&&!availableStreams().length?'SOURCE_COOLDOWN':'NO_SOURCES',originalCount&&!availableStreams().length?'Sources are cooling down':mode==='require'?'No English dub found':'No streams found');
+        const sourceCooldown=originalCount&&!availableStreams().length;
+        const onlyAudioMismatch=mode==='require'&&originalCount>0&&!!pickBest(streams,{...choiceOptions,mode:'off'})&&!pickBest(streams,choiceOptions);
+        throw failure(sourceCooldown?'SOURCE_COOLDOWN':'NO_SOURCES',sourceCooldown?'Sources are cooling down':onlyAudioMismatch?'No English-audio source was listed':'No compatible episode sources were returned');
       }
 
       job.quality = choice.res ? `${choice.res}p` : '?';

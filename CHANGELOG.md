@@ -88,3 +88,10 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Back off Stremio add-ons that repeatedly fail: 30 minutes for persistent client errors and 5 minutes with exponential growth up to 30 minutes for timeouts, network errors, and server errors. Successful or empty responses clear provider backoff; expired providers are retried.
 - Record typed source-test outcomes and expose privacy-safe hourly diagnostic summaries retained for 14 days through `/api/diagnostics/sources`.
 - After finalizing a torrent download, compare SHA-256 fingerprints of the staged source and final file; remove only that verified staged file after all active references to its torrent have ended.
+
+## 0.4.16
+
+- Limit simultaneous provider requests per service origin and stagger requests to prevent queued episodes from flooding shared add-on hosts.
+- Apply a shared, expiring host cooldown after HTTP 429 responses; honor `Retry-After` and retain endpoint-specific cooldowns.
+- Treat the English audio checkbox as a preference, allowing another listed release when no English-labeled one is available.
+- Report an empty compatible-source result accurately instead of labeling an empty provider response as a missing English dub.

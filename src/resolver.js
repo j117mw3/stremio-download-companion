@@ -20,24 +20,42 @@ async function getJson(url, signal, timeoutMs = 30000) {
   return r.json();
 }
 
-/** A FIFO, process-wide limit shared by every active episode lookup. */
+/** A fair process-wide request limit with a small per-origin burst budget. */
 export class ProviderRequestPool {
-  constructor(limit=32){this.limit=limit;this.active=0;this.waiters=[];}
-  acquire(signal){
+  constructor(limit=32,{perOriginLimit=2,originSpacingMs=750,now=Date.now}={}){
+    this.limit=limit;this.perOriginLimit=perOriginLimit;this.originSpacingMs=originSpacingMs;this.now=now;
+    this.active=0;this.waiters=[];this.activeByOrigin=new Map();this.lastStartByOrigin=new Map();this.drainTimer=null;
+  }
+  acquire(signal,originId=''){
     signal?.throwIfAborted();
     return new Promise((resolve,reject)=>{
-      const item={signal,resolve,reject};
-      item.abort=()=>{this.waiters=this.waiters.filter(waiter=>waiter!==item);reject(signal.reason||new Error('Provider lookup cancelled'));};
+      const item={signal,originId,resolve,reject};
+      item.abort=()=>{this.waiters=this.waiters.filter(waiter=>waiter!==item);reject(signal.reason||new Error('Provider lookup cancelled'));this.drain();};
       signal?.addEventListener('abort',item.abort,{once:true});
       this.waiters.push(item);this.drain();
     });
   }
   drain(){
+    clearTimeout(this.drainTimer);this.drainTimer=null;
     while(this.active<this.limit&&this.waiters.length){
-      const item=this.waiters.shift();item.signal?.removeEventListener('abort',item.abort);
-      if(item.signal?.aborted){item.reject(item.signal.reason);continue;}
-      this.active++;let released=false;
-      item.resolve(()=>{if(released)return;released=true;this.active--;this.drain();});
+      const now=this.now();let selected=-1,nextReadyAt=Infinity;
+      for(let index=0;index<this.waiters.length;index++){
+        const item=this.waiters[index];
+        if(item.signal?.aborted){this.waiters.splice(index--,1);item.signal.removeEventListener('abort',item.abort);item.reject(item.signal.reason||new Error('Provider lookup cancelled'));continue;}
+        const activeForOrigin=this.activeByOrigin.get(item.originId)||0;
+        if(item.originId&&activeForOrigin>=this.perOriginLimit)continue;
+        const readyAt=item.originId?(this.lastStartByOrigin.get(item.originId)||-Infinity)+this.originSpacingMs:-Infinity;
+        if(readyAt<=now){selected=index;break;}
+        nextReadyAt=Math.min(nextReadyAt,readyAt);
+      }
+      if(selected<0){
+        if(Number.isFinite(nextReadyAt)){this.drainTimer=setTimeout(()=>this.drain(),Math.max(1,nextReadyAt-this.now()));this.drainTimer.unref?.();}
+        break;
+      }
+      const item=this.waiters.splice(selected,1)[0];item.signal?.removeEventListener('abort',item.abort);
+      this.active++;if(item.originId){this.activeByOrigin.set(item.originId,(this.activeByOrigin.get(item.originId)||0)+1);this.lastStartByOrigin.set(item.originId,this.now());}
+      let released=false;
+      item.resolve(()=>{if(released)return;released=true;this.active--;if(item.originId){const active=(this.activeByOrigin.get(item.originId)||1)-1;if(active)this.activeByOrigin.set(item.originId,active);else this.activeByOrigin.delete(item.originId);}this.drain();});
     }
   }
   snapshot(){return {active:this.active,waiting:this.waiters.length,limit:this.limit};}
@@ -50,6 +68,11 @@ export const PROVIDER_WORKERS_PER_EPISODE=8;
 export function providerIdentifier(addon){
   // Hash the endpoint, never expose an add-on URL in diagnostics or job state.
   return createProviderHash(addon.url);
+}
+
+export function providerOriginIdentifier(addon){
+  try{return createProviderHash(new URL(addon.url).origin).replace(/^p-/,'h-');}
+  catch{return createProviderHash('').replace(/^p-/,'h-');}
 }
 
 function createProviderHash(value){
@@ -152,25 +175,32 @@ function mergeStreams(collected){
  * The lookup retains the older all-results promise API through getStreams(). */
 export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{},providerHistory={},providers:providedProviders,pool=providerRequestPool,timeoutMs=PROVIDER_TIMEOUT_MS,workersPerEpisode=PROVIDER_WORKERS_PER_EPISODE,now=Date.now}={}){
   const nowFn=typeof now==='function'?now:()=>now;
-  const allProviders=(providedProviders||streamProviders()).map(addon=>({...addon,names:addon.names||[addon.name].filter(Boolean),id:addon.id||providerIdentifier(addon)}));
+  const allProviders=(providedProviders||streamProviders()).map(addon=>({...addon,names:addon.names||[addon.name].filter(Boolean),id:addon.id||providerIdentifier(addon),originId:addon.originId||providerOriginIdentifier(addon)}));
   // Skip providers during their expiring backoff. If every provider is cooling
   // down this lookup returns promptly; a later retry after expiry probes them.
-  const providers=allProviders.filter(provider=>(Number(providerHistory?.[provider.id]?.cooldownUntil)||0)<=nowFn())
+  const providers=allProviders.filter(provider=>(Number(providerHistory?.[provider.id]?.cooldownUntil)||0)<=nowFn()&&(Number(providerHistory?.[provider.originId]?.cooldownUntil)||0)<=nowFn())
     .sort((a,b)=>providerPriority(b,providerHistory,nowFn())-providerPriority(a,providerHistory,nowFn()));
-  const collected=[],diagnostics=[],changeListeners=new Set();let cursor=0,completed=0,done=false;
-  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length,suppressedCount:allProviders.length-providers.length,elapsedMs:Math.max(0,nowFn()-started),done});
+  const collected=[],diagnostics=[],changeListeners=new Set();let cursor=0,completed=0,dynamicSuppressed=0,done=false;
+  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length-dynamicSuppressed,suppressedCount:allProviders.length-providers.length+dynamicSuppressed,elapsedMs:Math.max(0,nowFn()-started),done});
   const publish=()=>{try{onUpdate(snapshot());}catch{}for(const listener of [...changeListeners])listener();};
   const started=nowFn();
   const worker=async()=>{
     while(cursor<providers.length&&!signal?.aborted){
-      const provider=providers[cursor++];let release=null,resultCount=0,status='network_error',category='network_error',latencyMs=0;
-      const requestStarted=nowFn();
+      const provider=providers[cursor++];
+      if((Number(providerHistory?.[provider.id]?.cooldownUntil)||0)>nowFn()||(Number(providerHistory?.[provider.originId]?.cooldownUntil)||0)>nowFn()){
+        dynamicSuppressed++;publish();continue;
+      }
+      let release=null,resultCount=0,status='network_error',category='network_error',latencyMs=0,retryAfterMs=0,requestStarted=0;
       try{
-        release=await pool.acquire(signal);
+        release=await pool.acquire(signal,provider.originId);
+        if((Number(providerHistory?.[provider.id]?.cooldownUntil)||0)>nowFn()||(Number(providerHistory?.[provider.originId]?.cooldownUntil)||0)>nowFn()){
+          release();release=null;dynamicSuppressed++;publish();continue;
+        }
+        requestStarted=nowFn();
         const timeout=AbortSignal.timeout(timeoutMs);
         const requestSignal=signal?AbortSignal.any([signal,timeout]):timeout;
         const response=await fetch(streamEndpoint(provider,epId),{headers:{'User-Agent':'stremio-season-downloader'},signal:requestSignal});
-        if(!response.ok){status='http_error';category=`http_${response.status}`;throw Object.assign(new Error(`Provider HTTP ${response.status}`),{providerCategory:category});}
+        if(!response.ok){status='http_error';category=`http_${response.status}`;if(response.status===429){const value=response.headers.get('retry-after');const seconds=Number(value);const parsedDate=Date.parse(value||'');retryAfterMs=Number.isFinite(seconds)&&seconds>0?seconds*1000:Number.isFinite(parsedDate)?Math.max(0,parsedDate-nowFn()):0;}throw Object.assign(new Error(`Provider HTTP ${response.status}`),{providerCategory:category});}
         const payload=await response.json();
         if(!payload||!Array.isArray(payload.streams)){status='invalid_response';category='invalid_response';}
         else {
@@ -183,13 +213,11 @@ export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{
         if(error?.name==='TimeoutError'||error?.name==='AbortError'||error?.cause?.name==='TimeoutError'){status='timeout';category='timeout';}
         else if(error?.providerCategory){status='http_error';category=error.providerCategory;}
         else if(status!=='invalid_response'){status='network_error';category='network_error';}
-      }finally{
-        release?.();latencyMs=Math.max(0,nowFn()-requestStarted);
-      }
-      if(signal?.aborted)break;
-      const result={providerId:provider.id,status,category,latencyMs,resultCount};
+      }finally{latencyMs=requestStarted?Math.max(0,nowFn()-requestStarted):0;}
+      if(signal?.aborted){release?.();break;}
+      const result={providerId:provider.id,originId:provider.originId,status,category,latencyMs,resultCount,retryAfterMs};
       diagnostics.push(result);completed++;
-      try{onProvider({...result});}catch{}
+      try{onProvider({...result});}catch{}finally{release?.();release=null;}
       publish();
     }
   };
