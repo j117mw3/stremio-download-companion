@@ -45,3 +45,12 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Queue controls, individual removal, remove-all, and persisted state.
 - Torrent metadata caching, tracker fallbacks, source fallback, retained partial pieces, and resumable HTTP transfers.
 - Windows installer and tray application.
+
+## 0.4.11
+
+- Track rolling 30-second episode rates and compare sources after 60 seconds of sustained slow progress.
+- Keep the current transfer running while testing up to two eligible alternatives; choose a replacement only when verified episode data is at least 2x faster and 0.25 MiB/s faster.
+- Remove the artificial candidate speed ceiling while retaining payload, time, setup, quality, fallback, and shared-activity limits.
+- Yield slow jobs behind ready queue work without discarding source-specific partials, then resume them fairly when capacity opens.
+- Show rolling rates, source-comparison progress, candidate rates, and when an episode waits behind other downloads.
+- Store expiring source-speed history under opaque identifiers and mark a source slow only after a confirmed speed comparison.

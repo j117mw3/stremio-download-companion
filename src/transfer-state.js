@@ -32,13 +32,18 @@ export function selectFile(entry,file) {
 }
 
 export class FileProgress {
-  constructor(bytes,now){this.bytes=bytes;this.tick=now;this.lastProgress=now;}
+  constructor(bytes,now){this.bytes=bytes;this.tick=now;this.lastProgress=now;this.samples=[{bytes,at:now}];this.rollingSpeed=0;}
   sample(bytes,now){
     const changed=bytes>this.bytes;
     const speed=changed?(bytes-this.bytes)*1000/Math.max(1,now-this.tick):0;
     if(changed)this.lastProgress=now;
+    this.samples.push({bytes,at:now});
+    const cutoff=now-30000;
+    while(this.samples.length>2&&this.samples[1].at<=cutoff)this.samples.shift();
+    const first=this.samples[0];
+    this.rollingSpeed=Math.max(0,(bytes-first.bytes)*1000/Math.max(1,now-first.at));
     this.bytes=bytes;this.tick=now;
-    return {speed,idleMs:now-this.lastProgress};
+    return {speed,rollingSpeed:this.rollingSpeed,idleMs:now-this.lastProgress};
   }
 }
 
