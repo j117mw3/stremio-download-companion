@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import parseTorrent from 'parse-torrent';
 import { cfg } from './config.js';
 import { getStreams, pickBest, effectiveDubMode, parseStream } from './resolver.js';
+import { SourceDiagnostics } from './source-diagnostics.js';
 
 const pad = (n) => String(n).padStart(2, '0');
 const safe = (s) => String(s).replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim() || 'untitled';
@@ -57,16 +58,26 @@ function namesEpisode(text, job) {
   return !!m&&Number(m[1])===job.season&&Number(m[2])===job.episode;
 }
 
-function torrentEpisodeFile(torrent, choice, job) {
-  if(Number.isInteger(choice.fileIdx))return torrent.files[choice.fileIdx]||null;
+export function torrentEpisodeFile(torrent, choice, job) {
   const videos=torrent.files.filter(file=>VIDEO_EXT.test(file.path));
+  const episodeTagMatches=file=>{
+    const tag=/s(\d+)[ ._-]*e(\d+)/i.exec(path.basename(file.path));
+    return !tag||(Number(tag[1])===job.season&&Number(tag[2])===job.episode);
+  };
+  const indexed=Number.isInteger(choice.fileIdx)?torrent.files[choice.fileIdx]:null;
+  if(indexed&&VIDEO_EXT.test(indexed.path)&&episodeTagMatches(indexed))return indexed;
+  // A provider's fileIdx can point at a neighboring episode. If it does,
+  // prefer a unique provider filename or episode tag and reject ambiguity.
   if(choice.filename){
     const target=path.basename(choice.filename).toLowerCase();
     const exact=videos.filter(file=>path.basename(file.path).toLowerCase()===target);
-    if(exact.length===1)return exact[0];
+    if(exact.length===1&&episodeTagMatches(exact[0]))return exact[0];
+    if(exact.length>1)return null;
   }
   const tagged=videos.filter(file=>namesEpisode(file.path,job));
   if(tagged.length===1)return tagged[0];
+  if(tagged.length>1)return null;
+  if(indexed)return null;
   // Some Stremio add-ons return a single-episode torrent without fileIdx. Only
   // infer its sole video file when the provider's own label names this episode.
   if(videos.length===1&&namesEpisode(choice.title+' '+(choice.filename||''),job))return videos[0];
@@ -88,7 +99,8 @@ export class Downloader {
     this.torrents = new Map(); // infoHash -> { refs, promise, torrent, tmp }
     this.seasonHashes = new Map(); // series|season -> Set(infoHash) chosen so far
     this.saveTimer = null;
-    this.cooldowns={};this.contexts=new Map();this.extraBudget=new ExtraBudget(2);this.sourceResults={};
+    this.cooldowns={};this.contexts=new Map();this.extraBudget=new ExtraBudget(2);this.sourceResults={};this.providerResults={};
+    this.lastDeferredSeries=null;this.sourceDiagnostics=new SourceDiagnostics(this.store.directory);
     this.load();
   }
 
@@ -97,6 +109,8 @@ export class Downloader {
     this.cooldowns=cooldowns&&!Array.isArray(cooldowns)&&typeof cooldowns==='object'?cooldowns:{};
     const results=this.store.read('sourceResults');this.sourceResults=results&&!Array.isArray(results)&&typeof results==='object'?results:{};
     for(const [key,result] of Object.entries(this.sourceResults))if(!Number.isFinite(result?.expires)||result.expires<=this.now())delete this.sourceResults[key];
+    const providerResults=this.store.read('providerResults');this.providerResults=providerResults&&!Array.isArray(providerResults)&&typeof providerResults==='object'?providerResults:{};
+    for(const [key,result] of Object.entries(this.providerResults))if(!Number.isFinite(result?.expires)||result.expires<=this.now())delete this.providerResults[key];
     this.jobs=this.store.read('jobs');
     if(this.jobs===null){
       this.jobs=[];
@@ -140,6 +154,7 @@ export class Downloader {
     this.store.write('jobs',this.jobs);
     this.store.write('sourceCooldowns',this.cooldowns||{});
     this.store.write('sourceResults',this.sourceResults||{});
+    this.store.write('providerResults',this.providerResults||{});
   }
 
   async getClient() {
@@ -147,9 +162,35 @@ export class Downloader {
     return this.client;
   }
 
-  async streamsFor(id, signal) {
-    return getStreams(id,{signal});
+  async streamsFor(id, signal, options={}) {
+    return getStreams(id,{...options,signal,providerHistory:this.providerResults});
   }
+
+  recordProviderResponse(job,record){
+    const now=this.now(),previous=this.providerResults?.[record.providerId]||{};
+    const responsive=['ok','empty'].includes(record.status);
+    this.providerResults||={};
+    this.providerResults[record.providerId]={responsive,latencyMs:record.latencyMs,responseAt:now,cooldownUntil:responsive?0:now+5*60000,usefulRate:previous.usefulAt>now-30*60000?previous.usefulRate||0:0,usefulAt:previous.usefulAt||0,expires:now+30*60000};
+    this.sourceDiagnostics?.record({event:'provider_response',time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),providerId:record.providerId,status:record.status,category:record.category,latencyMs:record.latencyMs,resultCount:record.resultCount});
+    this.save();
+  }
+
+  recordSourceDiagnostic(job,source,event,outcome={}){
+    const now=this.now(),providerIds=Array.isArray(source?.providerIds)?source.providerIds:[];
+    const status=outcome.status||'working';
+    const category=String(outcome.code||'').toLowerCase()||status;
+    const releaseId=this.historyKey(source);
+    for(const providerId of providerIds){
+      this.sourceDiagnostics?.record({event,time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),providerId,releaseId,status,category,quality:source.res||0,bytes:outcome.bytes,verifiedBytes:outcome.verifiedBytes,rate:outcome.speed});
+      if(outcome.verifiedDownload&&status==='working'){
+        const previous=this.providerResults?.[providerId]||{};
+        this.providerResults[providerId]={...previous,usefulRate:Math.max(Number(previous.usefulRate)||0,Number(outcome.speed)||0),usefulAt:now,expires:now+30*60000};
+      }
+    }
+    if(event==='source_selected'&&!providerIds.length)this.sourceDiagnostics?.record({event,time:now,job:createHash('sha256').update(String(job.id)).digest('hex').slice(0,32),releaseId,quality:source.res||0});
+  }
+
+  getSourceDiagnostics(limit=100){return this.sourceDiagnostics?.list(limit)||[];}
 
   /** Queue episodes. Active entries are retained; completed files are rechecked before reuse. */
   enqueue({ kind, series, seriesName, episodes, profile = {} }) {
@@ -212,6 +253,7 @@ export class Downloader {
     const key=this.historyKey(source),now=this.now();
     this.sourceResults||={};
     this.sourceResults[key]={...outcome,time:now,expires:now+15*60000,swarmKey:key,seriesKey:createHash('sha256').update(String(job.series)).digest('hex')};
+    this.recordSourceDiagnostic(job,source,outcome.verifiedDownload?'source_verified':'source_result',outcome);
     for(const [entry,value] of Object.entries(this.sourceResults))if(value.expires<now)delete this.sourceResults[entry];
     this.save();
   }
@@ -227,10 +269,11 @@ export class Downloader {
     if(exact?.status==='working')return exact.speed||0;
     if(exact?.status==='slow')return -Math.max(1,exact.speed||0);
     if(exact?.status==='failed')return -1;
+    const providerRate=Math.max(0,...(source.providerIds||[]).map(id=>Number(this.providerResults?.[id]?.usefulRate)||0));
     const swarmKey=this.historyKey(source);
     const seriesKey=createHash('sha256').update(String(job.series)).digest('hex');
     const positive=Object.values(results).filter(r=>r.expires>this.now()&&r.status==='working'&&r.swarmKey===swarmKey&&r.seriesKey===seriesKey);
-    return positive.length?Math.max(...positive.map(r=>r.speed||0)):0;
+    return Math.max(providerRate,positive.length?Math.max(...positive.map(r=>r.speed||0)):0);
   }
 
   activeEpisodeRates(exceptId) {
@@ -281,6 +324,24 @@ export class Downloader {
     }else {job.status='retry_wait';job.stage='Retry scheduled';job.nextRetryAt=this.now()+RETRY_DELAYS[round];job.retryRound=round+1;}
   }
 
+  nextDeferredJob(now){
+    const due=this.jobs.filter(job=>job.status==='deferred'&&!this.controllers.has(job.id)&&Number.isFinite(job.nextRetryAt)&&job.nextRetryAt<=now);
+    if(!due.length)return null;
+    const activeSeries=new Set(this.jobs.filter(job=>job.backgroundRetryActive&&this.controllers.has(job.id)).map(job=>job.series||job.seriesName));
+    let eligible=due.filter(job=>!activeSeries.has(job.series||job.seriesName));if(!eligible.length)eligible=due;
+    const groups=new Map();
+    for(const job of eligible){const key=job.series||job.seriesName||job.id;if(!groups.has(key))groups.set(key,[]);groups.get(key).push(job);}
+    let series=[...groups.keys()];
+    if(series.length>1&&this.lastDeferredSeries!==null){const rotated=series.filter(key=>key!==this.lastDeferredSeries);if(rotated.length)series=rotated;}
+    series.sort((a,b)=>{
+      const left=groups.get(a).reduce((x,j)=>Math.min(x,j.nextRetryAt),Infinity),right=groups.get(b).reduce((x,j)=>Math.min(x,j.nextRetryAt),Infinity);
+      if(left!==right)return left-right;
+      return Math.min(...groups.get(a).map(j=>j.queueOrder??0))-Math.min(...groups.get(b).map(j=>j.queueOrder??0));
+    });
+    const key=series[0];this.lastDeferredSeries=key;
+    return groups.get(key).sort((a,b)=>(a.nextRetryAt-b.nextRetryAt)||((a.queueOrder??0)-(b.queueOrder??0)))[0];
+  }
+
   pump() {
     clearTimeout(this.retryTimer);
     if(this.stopping||this.clearing)return;
@@ -292,11 +353,10 @@ export class Downloader {
     while (this.active < limit) {
       const queued=this.jobs.filter(j=>j.status==='queued'&&!this.controllers.has(j.id)).sort((a,b)=>(a.queueOrder??0)-(b.queueOrder??0));
       const probe=this.active>=cfg.concurrency;
-      const activeDeferred=this.jobs.some(j=>j.backgroundRetryActive&&this.controllers.has(j.id));
       let job=(probe&&stalled.length?queued.find(j=>stalled.some(s=>s.series===j.series&&s.season===j.season)):null)||queued[0];
       let deferred=false;
-      if(!job&&!probe&&this.active<cfg.concurrency&&!activeDeferred){
-        job=this.jobs.filter(j=>j.status==='deferred'&&!this.controllers.has(j.id)&&Number.isFinite(j.nextRetryAt)&&j.nextRetryAt<=now).sort((a,b)=>(a.nextRetryAt-b.nextRetryAt)||(a.queueOrder-b.queueOrder))[0];
+      if(!job&&!probe&&this.active<cfg.concurrency){
+        job=this.nextDeferredJob(now);
         deferred=!!job;
       }
       if (!job) break;
@@ -318,6 +378,7 @@ export class Downloader {
 
   async run(job) {
     const controller = new AbortController(); this.controllers.set(job.id,controller);
+    let lookupController=null,lookupPromise=null,lookupDeadlineTimer=null;
     try {
       job.status = 'resolving';
       job.runStartedAt=this.now();job.lastProgressAt=null;job.idleSeconds=0;
@@ -352,23 +413,68 @@ export class Downloader {
       if (!this.seasonHashes.has(key)) this.seasonHashes.set(key, new Set());
       const hashes = this.seasonHashes.get(key);
 
-      let streams;
-      try{streams=await this.streamsFor(job.id,controller.signal);}catch(e){controller.signal.throwIfAborted();throw failure('PROVIDER_FAILURE',e.message);}
-      const originalCount=streams.length;
-      streams=streams.filter(raw=>this.available(job,parseStream(raw)));
       const choiceOptions = { mode, connectivityScore:source=>this.connectivityScore(job,source), preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
-      const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
       const attemptedSources=new Set();
       const sourceTurnStartedAt=this.now(),sourceTurnDeadline=sourceTurnStartedAt+SOURCE_TURN_LIMIT_MS;
       job.sourceSearch={startedAt:sourceTurnStartedAt,deadlineAt:sourceTurnDeadline,elapsedSeconds:0,limitSeconds:SOURCE_TURN_LIMIT_MS/1000,attempted:0,maxSources:MAX_SOURCE_TURN_SOURCES,phase:'searching'};
+      let streams=[],lookupComplete=false,lookupError=null;
+      lookupController=new AbortController();
+      const lookupSignal=AbortSignal.any([controller.signal,lookupController.signal]);
+      const feedWaiters=new Set();
+      const wakeFeed=()=>{for(const resolve of [...feedWaiters])resolve();};
+      const waitForFeed=(ms=100)=>new Promise(resolve=>{let settled=false;const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);feedWaiters.delete(finish);resolve();};const timer=setTimeout(finish,Math.max(1,ms));feedWaiters.add(finish);});
+      const updateDiscovery=snapshot=>{
+        if(Array.isArray(snapshot?.streams))streams=snapshot.streams;
+        const records=Array.isArray(snapshot?.diagnostics)?snapshot.diagnostics:[];
+        job.sourceDiscovery={
+          phase:snapshot?.done?'complete':'searching',startedAt:sourceTurnStartedAt,
+          elapsedSeconds:Math.max(0,Math.floor((this.now()-sourceTurnStartedAt)/1000)),
+          providerCount:Number(snapshot?.providerCount)||0,completed:Number(snapshot?.completed)||0,
+          responsive:records.filter(record=>['ok','empty'].includes(record.status)).length,
+          empty:records.filter(record=>record.status==='empty').length,
+          timeouts:records.filter(record=>record.status==='timeout').length,
+          errors:records.filter(record=>!['ok','empty','timeout'].includes(record.status)).length,
+          releases:streams.length,
+        };
+        if(snapshot?.done)lookupComplete=true;
+        this.save();wakeFeed();
+      };
+      lookupPromise=Promise.resolve().then(()=>this.streamsFor(job.id,lookupSignal,{
+        onUpdate:updateDiscovery,
+        onProvider:record=>this.recordProviderResponse(job,record),
+      })).then(result=>{
+        if(Array.isArray(result)){streams=result;if(!job.sourceDiscovery||!job.sourceDiscovery.providerCount)updateDiscovery({streams,diagnostics:[],completed:0,providerCount:0,done:true});}
+        lookupComplete=true;wakeFeed();return streams;
+      },error=>{
+        lookupError=error;lookupComplete=true;
+        if(!controller.signal.aborted){const phase=lookupController.signal.reason?.code==='SOURCE_TURN_LIMIT'?'deadline':job.status==='done'?'stopped_after_selection':'stopped';job.sourceDiscovery={...(job.sourceDiscovery||{}),phase,elapsedSeconds:Math.max(0,Math.floor((this.now()-sourceTurnStartedAt)/1000))};}
+        wakeFeed();return streams;
+      });
+      lookupDeadlineTimer=setTimeout(()=>{if(!lookupController.signal.aborted)lookupController.abort(Object.assign(new Error('Source lookup reached the 60-second turn limit'),{code:'SOURCE_TURN_LIMIT'}));},Math.max(1,sourceTurnDeadline-this.now()));
+      const availableStreams=()=>streams.filter(raw=>this.available(job,parseStream(raw)));
       const choose=sources=>{
         const untried=sources.filter(raw=>!attemptedSources.has(this.turnIdentity(parseStream(raw))));
         const fresh=untried.filter(raw=>!job.recentSources?.includes(this.sourceKey(parseStream(raw))));
         return pickBest(fresh,choiceOptions)||pickBest(untried,choiceOptions);
       };
-      let choice = preferredSource&&!job.recentSources?.includes(this.sourceKey(parseStream(preferredSource))) ? pickBest([preferredSource], choiceOptions) : null;
-      if (!choice) choice = choose(streams);
-      if (!choice) throw failure(originalCount&&!streams.length?'SOURCE_COOLDOWN':'NO_SOURCES',originalCount&&!streams.length?'Sources are cooling down':mode==='require'?'No English dub found':'No streams found');
+      let choice=null,selectionGraceUntil=null;
+      while(!choice&&!lookupComplete&&this.now()<sourceTurnDeadline){
+        const current=availableStreams();
+        const preferred=job.sourceOverride&&current.find(raw=>createHash('sha256').update(JSON.stringify([raw.infoHash,raw.fileIdx,raw.url])).digest('hex')===job.sourceOverride);
+        const candidate=preferred&&!job.recentSources?.includes(this.sourceKey(parseStream(preferred)))?pickBest([preferred],choiceOptions):choose(current);
+        const requested=Number(job.profile?.resolution)||0;
+        if(candidate){
+          if(lookupComplete||(requested&&candidate.res===requested))choice=candidate;
+          else {selectionGraceUntil??=this.now()+1500;if(this.now()>=selectionGraceUntil)choice=candidate;}
+        }
+        if(!choice)await waitForFeed(Math.min(250,Math.max(1,sourceTurnDeadline-this.now())));
+      }
+      if(!choice){const current=availableStreams();choice=choose(current);}
+      if(!choice){
+        const originalCount=streams.length;
+        if(lookupError&&!originalCount)throw failure('PROVIDER_FAILURE','Provider lookup did not return a usable response');
+        throw failure(originalCount&&!availableStreams().length?'SOURCE_COOLDOWN':'NO_SOURCES',originalCount&&!availableStreams().length?'Sources are cooling down':mode==='require'?'No English dub found':'No streams found');
+      }
 
       job.quality = choice.res ? `${choice.res}p` : '?';
       job.release = choice.title;
@@ -391,8 +497,9 @@ export class Downloader {
         job.sourceSearch.attempted=attemptedSources.size;job.sourceSearch.elapsedSeconds=Math.floor((this.now()-sourceTurnStartedAt)/1000);
         job.speed=0;job.torrentSpeed=0;job.progress=0;
         job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';
+        this.recordSourceDiagnostic(job,choice,'source_selected',{status:'working'});
         try {
-          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix,attemptedSources,sourceTurnDeadline);
+          job.file=await this.downloadWithComparison(job,choice,availableStreams(),choiceOptions,dir,prefix,attemptedSources,sourceTurnDeadline,availableStreams,()=>lookupComplete);
           completedThisTurn=true;
           break;
         }catch(e){
@@ -404,8 +511,8 @@ export class Downloader {
           job.recentSources=[...(job.recentSources||[]).filter(key=>key!==this.sourceKey(choice)),this.sourceKey(choice)].slice(-100);
           job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:1,code:e.code,error:e.message,time:this.now()});
           job.attempts=job.attempts.slice(-100);this.save();
-          streams=streams.filter(raw=>this.turnIdentity(parseStream(raw))!==identity&&this.available(job,parseStream(raw)));
-          const next=choose(streams);
+          let next=choose(availableStreams().filter(raw=>this.turnIdentity(parseStream(raw))!==identity));
+          while(!next&&!lookupComplete&&this.now()<sourceTurnDeadline&&attemptedSources.size<MAX_SOURCE_TURN_SOURCES){await waitForFeed(Math.min(250,Math.max(1,sourceTurnDeadline-this.now())));next=choose(availableStreams());}
           if(!next||this.now()>=sourceTurnDeadline||(!attemptedSources.has(this.turnIdentity(next))&&attemptedSources.size>=MAX_SOURCE_TURN_SOURCES))throw e;
           choice=next;job.fallbackReason='Previous source failed';job.stage='Trying another source';job.sourceSearch.phase='searching';
         }
@@ -428,7 +535,14 @@ export class Downloader {
       if(controller.signal.aborted&&['paused','cancelled'].includes(job.status))job.backgroundRetryActive=false;
       job.error = e.code==='YIELD_TRANSFER'||controller.signal.aborted ? null : e.message;
       job.speed = 0;
-    } finally {if(job.sourceSearch){if(job.sourceSearch.phase==='searching')job.sourceSearch.phase=job.status==='done'?'complete':'ended';job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;job.backgroundRetryActive=false;this.controllers.delete(job.id);}
+    } finally {
+      if(lookupController)lookupController.abort(failure('TEST_INCONCLUSIVE','Source lookup no longer needed'));
+      if(lookupDeadlineTimer)clearTimeout(lookupDeadlineTimer);
+      if(lookupPromise)await lookupPromise.catch(()=>{});
+      if(job.sourceDiscovery?.phase==='searching')job.sourceDiscovery.phase=job.status==='done'?'stopped_after_selection':job.status==='retry_wait'||job.status==='deferred'?'retry_scheduled':'stopped';
+      if(job.sourceSearch){if(job.sourceSearch.phase==='searching')job.sourceSearch.phase=job.status==='done'?'complete':'ended';job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}
+      job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;job.backgroundRetryActive=false;this.controllers.delete(job.id);
+    }
   }
 
   startAttempt(parent,choice,probe,ownerSignal,dir,prefix) {
@@ -465,33 +579,38 @@ export class Downloader {
     return attempt;
   }
 
-  async downloadWithComparison(job,choice,streams,options,dir,prefix,attemptedSources=new Set(),sourceTurnDeadline=null) {
+  async downloadWithComparison(job,choice,streams,options,dir,prefix,attemptedSources=new Set(),sourceTurnDeadline=null,getStreamsNow=()=>streams,discoveryDone=()=>true) {
     this.extraBudget||=new ExtraBudget(2);this.sourceResults||={};
-    const candidates=[];const seen=new Set([choice.url?'url:'+choice.url:'torrent:'+choice.infoHash]);
-    let remaining=streams.filter(raw=>this.available(job,parseStream(raw)));
-    const candidateLimit=Math.min(MAX_SOURCE_TURN_SOURCES-1,Math.max(0,MAX_SOURCE_TURN_SOURCES-attemptedSources.size));
-    const resolutions=[...new Set(remaining.map(raw=>parseStream(raw).res).filter(Boolean))];
+    const candidateLimit=Math.max(0,MAX_SOURCE_TURN_SOURCES-1);
     const requested=Number(job.profile?.resolution)||0;
-    resolutions.sort((a,b)=>Number(b===requested)-Number(a===requested)||b-a);
-    for(const resolution of resolutions){
-      let tier=remaining.filter(raw=>parseStream(raw).res===resolution);
-      while(tier.length&&candidates.length<candidateLimit){
-        const selected=pickBest(tier,options);if(!selected)break;
-        tier=tier.filter(raw=>raw!==selected.raw);remaining=remaining.filter(raw=>raw!==selected.raw);
-        const identity=selected.url?'url:'+selected.url:'torrent:'+selected.infoHash;
-        if(seen.has(identity)||attemptedSources.has(this.turnIdentity(selected)))continue;seen.add(identity);candidates.push(selected);
+    const candidatePool=()=>{
+      let remaining=getStreamsNow().filter(raw=>this.available(job,parseStream(raw)));
+      const result=[],seen=new Set([choice.url?'url:'+choice.url:'torrent:'+choice.infoHash]),resolutions=[...new Set(remaining.map(raw=>parseStream(raw).res))];
+      resolutions.sort((a,b)=>Number(b===requested)-Number(a===requested)||(b||0)-(a||0));
+      for(const resolution of resolutions){
+        let tier=remaining.filter(raw=>parseStream(raw).res===resolution);
+        while(tier.length&&result.length<Math.min(candidateLimit,Math.max(0,MAX_SOURCE_TURN_SOURCES-attemptedSources.size))){
+          const selected=pickBest(tier,options);if(!selected)break;
+          tier=tier.filter(raw=>raw!==selected.raw);remaining=remaining.filter(raw=>raw!==selected.raw);
+          const identity=selected.url?'url:'+selected.url:'torrent:'+selected.infoHash;
+          if(seen.has(identity)||attemptedSources.has(this.turnIdentity(selected)))continue;
+          seen.add(identity);result.push(selected);
+        }
+        if(result.length>=candidateLimit)break;
       }
-      if(candidates.length>=candidateLimit)break;
-    }
+      return result;
+    };
+    const candidates=candidatePool();
     const signal=this.controllers.get(job.id).signal;
     const sync=attempt=>{
       for(const key of ['progress','speed','rollingSpeed','torrentSpeed','peers','downloadedBytes','idleSeconds','lastProgressAt','stage','totalBytes','sourceWaitStartedAt','waitLimitSeconds','metadataWaitStartedAt','sourceResponseAt','dataStartedAt'])job[key]=attempt.job[key];
       if(job.sourceSearch?.phase==='searching'&&attempt.job.lastProgressAt)job.sourceSearch.phase='transferring';
     };
     const tested=[];
-    const result=await compareSources({signal,primary:choice,candidates,budget:this.extraBudget,now:()=>this.now(),
+    const result=await compareSources({signal,primary:choice,candidates,getCandidates:candidatePool,discoveryDone,budget:this.extraBudget,now:()=>this.now(),
       start:(source,probe,owner)=>{
         if(probe){attemptedSources.add(this.turnIdentity(source));if(job.sourceSearch){job.sourceSearch.attempted=attemptedSources.size;job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}}
+        this.recordSourceDiagnostic(job,source,'source_selected',{status:'working'});
         const attempt=this.startAttempt(job,source,probe,owner,dir,prefix);
         if(probe)tested.push(attempt);
         return attempt;

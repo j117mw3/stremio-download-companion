@@ -58,7 +58,7 @@ export const testStopped=reason=>failure('TEST_INCONCLUSIVE',reason);
 
 // The shared budget admits waiting first candidates before second candidates.
 // Up to two alternatives may run together when capacity is available.
-export async function compareSources({signal,primary,candidates,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch,noDataAfterMs=15000,noDataLimitMs=45000,comparisonLimitMs=30000,sourceTurnDeadline=null}){
+export async function compareSources({signal,primary,candidates,getCandidates=null,discoveryDone=()=>true,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch,noDataAfterMs=15000,noDataLimitMs=45000,comparisonLimitMs=30000,sourceTurnDeadline=null}){
   const active=new Set();let original,adopted,testing=false,testDone=false,testTask=null,stop;
   const owned=new AbortController();const combined=AbortSignal.any([signal,owned.signal]);
   const own=(choice,probe)=>{const attempt=start(choice,probe,combined);active.add(attempt);attempt.promise.then(value=>{attempt.result={value};},error=>{attempt.result={error};});return attempt;};
@@ -106,13 +106,21 @@ export async function compareSources({signal,primary,candidates,start,budget,now
       }
     };
     try{
-      const candidateCount=mode==='slow'?Math.min(2,candidates.length):candidates.length;
-      for(let offset=0;offset<candidateCount&&!testSignal.aborted&&!recovered();){
-        const wave=[candidates[offset]];
+      const candidateCap=mode==='slow'?2:(getCandidates?4:candidates.length);
+      const testedKeys=new Set();let offset=0;
+      const candidateKey=choice=>choice.infoHash?'torrent:'+choice.infoHash.toLowerCase():'url:'+choice.url;
+      while(offset<candidateCap&&!testSignal.aborted&&!recovered()){
+        const available=getCandidates?getCandidates():candidates;
+        const first=available.find(choice=>!testedKeys.has(candidateKey(choice)));
+        if(!first){if(!getCandidates||discoveryDone())break;await new Promise(resolve=>setTimeout(resolve,100));continue;}
+        const wave=[first];testedKeys.add(candidateKey(first));
         let end=offset+1;
         // Never probe a lower quality while an eligible requested-quality
         // release in this turn is still being tested.
-        while(end<candidateCount&&wave.length<2&&candidates[end].res===wave[0].res){wave.push(candidates[end]);end++;}
+        if(offset+1<candidateCap){
+          const second=available.find(choice=>!testedKeys.has(candidateKey(choice))&&choice.res===first.res);
+          if(second){wave.push(second);testedKeys.add(candidateKey(second));end++;}
+        }
         pool=new Set();finished=0;
         const workers=wave.map((choice,index)=>runCandidate(choice,offset+index));
         const all=Promise.allSettled(workers);
@@ -157,7 +165,7 @@ export async function compareSources({signal,primary,candidates,start,budget,now
       if(testing&&testDone&&recovered()){testing=false;testDone=false;testTask=null;recoveryStart=null;triggerMode=null;}
       if(!testing&&(idleDue||slowDue)){
         triggerMode=slowDue?'slow':'idle';
-        if(candidates.length){
+        if(candidates.length||(getCandidates&&(getCandidates().length||!discoveryDone()))){
           if(triggerMode==='idle'&&sourceTurnDeadline!==null&&now()>=sourceTurnDeadline){original.cancel();await original.promise.catch(()=>{});throw terminalFailure();}
           testing=true;recoveryStart=now();recoveryVerified=original.evidence.verified;
           const limit=triggerMode==='idle'&&sourceTurnDeadline!==null?Math.max(0,sourceTurnDeadline-now()):comparisonLimitMs;

@@ -71,3 +71,13 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Test requested-quality releases before explicitly permitted lower-quality fallbacks, and count only verified torrent episode bytes or valid HTTP video payload as useful connectivity.
 - Rank otherwise eligible releases using short-lived throughput from verified downloads and source comparisons; keep torrent history keyed by swarm and HTTP history keyed by a hashed hostname.
 - Show source-turn progress, candidate rates, and remaining search time in the queue while preserving retry behavior, partial downloads, and quality/audio restrictions.
+
+## 0.4.14
+
+- Start source-turn timing before Stremio add-on lookup and feed provider results into episode source selection as they arrive.
+- Share add-on requests fairly across queued jobs with a global limit of 32 in flight and no more than eight per episode.
+- Rank providers using recent response latency and verified download throughput; short-lived provider cooldowns only affect ordering.
+- Record rotating, privacy-safe source diagnostics with opaque provider and release identifiers, response categories, latency, result count, and verified transfer rates.
+- Retry up to four due deferred episodes in available normal slots after queued work drains, rotating fairly across shows while keeping fresh work first.
+- Recover the requested episode by a unique filename or episode tag when a provider's torrent file index points at another episode; reject ambiguous matches.
+- Expose concise add-on lookup progress in the queue and preserve existing request formats, source limits, quality rules, and media verification.

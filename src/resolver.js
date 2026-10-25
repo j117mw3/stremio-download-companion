@@ -1,5 +1,6 @@
 import { discover } from './profile.js';
 import { cfg } from './config.js';
+import { createHash } from 'node:crypto';
 
 const RES = [
   [/2160p|\b4k\b|\buhd\b/i, 2160],
@@ -17,6 +18,51 @@ async function getJson(url, signal, timeoutMs = 30000) {
   const r = await fetch(url, { headers: { 'User-Agent': 'stremio-season-downloader' }, signal: requestSignal });
   if (!r.ok) throw new Error(`Provider HTTP ${r.status}`);
   return r.json();
+}
+
+/** A FIFO, process-wide limit shared by every active episode lookup. */
+export class ProviderRequestPool {
+  constructor(limit=32){this.limit=limit;this.active=0;this.waiters=[];}
+  acquire(signal){
+    signal?.throwIfAborted();
+    return new Promise((resolve,reject)=>{
+      const item={signal,resolve,reject};
+      item.abort=()=>{this.waiters=this.waiters.filter(waiter=>waiter!==item);reject(signal.reason||new Error('Provider lookup cancelled'));};
+      signal?.addEventListener('abort',item.abort,{once:true});
+      this.waiters.push(item);this.drain();
+    });
+  }
+  drain(){
+    while(this.active<this.limit&&this.waiters.length){
+      const item=this.waiters.shift();item.signal?.removeEventListener('abort',item.abort);
+      if(item.signal?.aborted){item.reject(item.signal.reason);continue;}
+      this.active++;let released=false;
+      item.resolve(()=>{if(released)return;released=true;this.active--;this.drain();});
+    }
+  }
+  snapshot(){return {active:this.active,waiting:this.waiters.length,limit:this.limit};}
+}
+
+export const providerRequestPool=new ProviderRequestPool(32);
+export const PROVIDER_TIMEOUT_MS=7000;
+export const PROVIDER_WORKERS_PER_EPISODE=8;
+
+export function providerIdentifier(addon){
+  // Hash the endpoint, never expose an add-on URL in diagnostics or job state.
+  return createProviderHash(addon.url);
+}
+
+function createProviderHash(value){
+  return `p-${createHash('sha256').update(String(value||'')).digest('hex').slice(0,24)}`;
+}
+
+function providerPriority(addon,history,now){
+  const entry=history?.[providerIdentifier(addon)];if(!entry||entry.expires<=now)return 0;
+  const cooling=!entry.responsive&&entry.cooldownUntil>now;
+  const responsiveness=entry.responsive?4:cooling?-4:0;
+  const latency=Math.max(0,Number(entry.latencyMs)||0);
+  const speed=entry.responsive?Math.max(0,Number(entry.usefulRate)||0):0;
+  return responsiveness-Math.min(3,latency/5000)+Math.min(4,Math.log2(1+speed/131072));
 }
 
 /** "tt0944947:1:2" -> imdb series, season 1, episode 2. "kitsu:1234:5" -> kitsu series, episode 5. */
@@ -82,46 +128,83 @@ function streamProviders() {
   return [...byUrl.values()];
 }
 
-/** Query the same installed series-stream add-ons Stremio uses, with bounded
- * concurrency and short per-provider timeouts so dead add-ons cannot stall a queue. */
-export async function getStreams(epId, { signal } = {}) {
-  const providers=streamProviders();
-  const collected=Array.from({length:providers.length},()=>[]);
-  let cursor=0;
-  const workers=Array.from({length:Math.min(16,providers.length)},async()=>{
+function mergeStreams(collected){
+  const unique=new Map();
+  for(const {stream,provider} of collected){
+    const hash=/^[a-f0-9]{40}$/i.test(stream.infoHash||'')?stream.infoHash.toLowerCase():null;
+    // A torrent hash is one release even if two add-ons return inconsistent
+    // file indexes. In that case, let the downloader resolve the file by name.
+    const key=/^https?:\/\//i.test(stream.url||'')?`url:${stream.url}`:hash?`btih:${hash}`:null;
+    if(!key)continue;
+    const previous=unique.get(key);
+    if(!previous){unique.set(key,{...stream,addonNames:[...provider.names],providerIds:[provider.id]});continue;}
+    previous.sources=[...new Set([...(Array.isArray(previous.sources)?previous.sources:[]),...(Array.isArray(stream.sources)?stream.sources:[])])];
+    previous.addonNames=[...new Set([...(previous.addonNames||[]),...provider.names])];
+    previous.providerIds=[...new Set([...(previous.providerIds||[]),provider.id])];
+    if(Number.isInteger(previous.fileIdx)&&Number.isInteger(stream.fileIdx)&&previous.fileIdx!==stream.fileIdx)previous.fileIdx=null;
+    if(!previous.behaviorHints?.filename&&stream.behaviorHints?.filename)previous.behaviorHints={...(previous.behaviorHints||{}),filename:stream.behaviorHints.filename};
+    if(!previous.sources?.length&&stream.sources?.length)previous.sources=[...stream.sources];
+  }
+  return [...unique.values()];
+}
+
+/** Start an add-on lookup and publish each provider's results as they arrive.
+ * The lookup retains the older all-results promise API through getStreams(). */
+export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{},providerHistory={},providers:providedProviders,pool=providerRequestPool,timeoutMs=PROVIDER_TIMEOUT_MS,workersPerEpisode=PROVIDER_WORKERS_PER_EPISODE,now=Date.now}={}){
+  const nowFn=typeof now==='function'?now:()=>now;
+  const providers=(providedProviders||streamProviders()).map(addon=>({...addon,names:addon.names||[addon.name].filter(Boolean),id:addon.id||providerIdentifier(addon)}))
+    .sort((a,b)=>providerPriority(b,providerHistory,nowFn())-providerPriority(a,providerHistory,nowFn()));
+  const collected=[],diagnostics=[],changeListeners=new Set();let cursor=0,completed=0,done=false;
+  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length,elapsedMs:Math.max(0,nowFn()-started),done});
+  const publish=()=>{try{onUpdate(snapshot());}catch{}for(const listener of [...changeListeners])listener();};
+  const started=nowFn();
+  const worker=async()=>{
     while(cursor<providers.length&&!signal?.aborted){
-      const index=cursor++;
-      const provider=providers[index];
-      const requestSignal=signal?AbortSignal.any([signal,AbortSignal.timeout(7000)]):AbortSignal.timeout(7000);
+      const provider=providers[cursor++];let release=null,resultCount=0,status='network_error',category='network_error',latencyMs=0;
+      const requestStarted=nowFn();
       try{
-        const {streams}=await getJson(streamEndpoint(provider,epId),requestSignal,7000);
-        for(const stream of Array.isArray(streams)?streams:[]){
-          if(!stream||typeof stream!=='object')continue;
-          collected[index].push({...stream,addonNames:provider.names});
+        release=await pool.acquire(signal);
+        const timeout=AbortSignal.timeout(timeoutMs);
+        const requestSignal=signal?AbortSignal.any([signal,timeout]):timeout;
+        const response=await fetch(streamEndpoint(provider,epId),{headers:{'User-Agent':'stremio-season-downloader'},signal:requestSignal});
+        if(!response.ok){status='http_error';category=`http_${response.status}`;throw Object.assign(new Error(`Provider HTTP ${response.status}`),{providerCategory:category});}
+        const payload=await response.json();
+        if(!payload||!Array.isArray(payload.streams)){status='invalid_response';category='invalid_response';}
+        else {
+          const streams=payload.streams.filter(item=>item&&typeof item==='object');resultCount=streams.length;
+          for(const stream of streams)collected.push({stream,provider});
+          status=resultCount?'ok':'empty';category=status;
         }
       }catch(error){
         if(signal?.aborted)break;
-        // Stremio profiles often contain retired or unrelated add-ons. A single
-        // unavailable provider must not prevent usable results from other ones.
+        if(error?.name==='TimeoutError'||error?.name==='AbortError'||error?.cause?.name==='TimeoutError'){status='timeout';category='timeout';}
+        else if(error?.providerCategory){status='http_error';category=error.providerCategory;}
+        else if(status!=='invalid_response'){status='network_error';category='network_error';}
+      }finally{
+        release?.();latencyMs=Math.max(0,nowFn()-requestStarted);
       }
+      if(signal?.aborted)break;
+      const result={providerId:provider.id,status,category,latencyMs,resultCount};
+      diagnostics.push(result);completed++;
+      try{onProvider({...result});}catch{}
+      publish();
     }
-  });
-  await Promise.all(workers);
-  if(signal?.aborted)signal.throwIfAborted();
+  };
+  const promise=(async()=>{
+    const workers=Array.from({length:Math.min(Math.max(1,workersPerEpisode),providers.length)},()=>worker());
+    await Promise.all(workers);
+    if(signal?.aborted)signal.throwIfAborted();
+    done=true;publish();return snapshot();
+  })();
+  return {promise,snapshot,get done(){return done;},waitForChange(ms=100){return new Promise(resolve=>{let settled=false;const finish=()=>{if(settled)return;settled=true;clearTimeout(timer);changeListeners.delete(finish);resolve(snapshot());};const timer=setTimeout(finish,ms);changeListeners.add(finish);});}};
+}
 
-  // The same torrent is often exposed by Torrentio variants. Merge duplicate
-  // tracker lists and provider names so retries do not revisit the same swarm.
-  const unique=new Map();
-  for(const stream of collected.flat()){
-    const hash=/^[a-f0-9]{40}$/i.test(stream.infoHash||'')?stream.infoHash.toLowerCase():null;
-    const index=Number.isInteger(stream.fileIdx)?stream.fileIdx:'unknown';
-    const key=/^https?:\/\//i.test(stream.url||'')?`url:${stream.url}`:hash?`btih:${hash}:${index}`:`other:${stream.addonNames.join('|')}:${stream.title||stream.name||''}`;
-    const previous=unique.get(key);
-    if(!previous){unique.set(key,stream);continue;}
-    previous.sources=[...new Set([...(Array.isArray(previous.sources)?previous.sources:[]),...(Array.isArray(stream.sources)?stream.sources:[])])];
-    previous.addonNames=[...new Set([...(previous.addonNames||[]),...(stream.addonNames||[])])];
-  }
-  return [...unique.values()].filter(stream=>/^[a-f0-9]{40}$/i.test(stream.infoHash||'')||/^https?:\/\//i.test(stream.url||''));
+/** Query installed Stremio add-ons. The callback is progressive; the returned
+ * promise still resolves to the complete stream array for compatibility. */
+export async function getStreams(epId,options={}) {
+  const lookup=createStreamLookup(epId,options);
+  const result=await lookup.promise;
+  return result.streams;
 }
 
 export function effectiveDubMode(kind) {
@@ -153,6 +236,7 @@ export function parseStream(s) {
     filename: s.behaviorHints?.filename || null,
     trackers,
     addonNames: Array.isArray(s.addonNames) ? s.addonNames : [],
+    providerIds: Array.isArray(s.providerIds) ? s.providerIds : [],
   };
 }
 
