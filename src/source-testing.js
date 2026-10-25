@@ -52,11 +52,13 @@ export function probeSelection(entry,file){
 }
 
 export const TEST_LIMIT=16*1024*1024;
+export const MAX_SOURCE_TURN_SOURCES=5;
+export const SOURCE_TURN_LIMIT_MS=60_000;
 export const testStopped=reason=>failure('TEST_INCONCLUSIVE',reason);
 
 // The shared budget admits waiting first candidates before second candidates.
 // Up to two alternatives may run together when capacity is available.
-export async function compareSources({signal,primary,candidates,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch,noDataAfterMs=15000,noDataLimitMs=45000,comparisonLimitMs=30000}){
+export async function compareSources({signal,primary,candidates,start,budget,now=Date.now,onView=()=>{},onResult=()=>{},shouldCompare=()=>false,isRecovered=()=>false,shouldYield=()=>false,shouldSwitch,noDataAfterMs=15000,noDataLimitMs=45000,comparisonLimitMs=30000,sourceTurnDeadline=null}){
   const active=new Set();let original,adopted,testing=false,testDone=false,testTask=null,stop;
   const owned=new AbortController();const combined=AbortSignal.any([signal,owned.signal]);
   const own=(choice,probe)=>{const attempt=start(choice,probe,combined);active.add(attempt);attempt.promise.then(value=>{attempt.result={value};},error=>{attempt.result={error};});return attempt;};
@@ -71,62 +73,76 @@ export async function compareSources({signal,primary,candidates,start,budget,now
     const candidateRate=candidate.evidence.score(now()),currentRate=rateOf(original);
     return shouldSwitch?shouldSwitch({currentRate,candidateRate,primary:original,candidate}):candidateRate>=currentRate*2&&candidateRate>=currentRate+262144;
   };
-  const test=async()=>{
+  const hasUsefulData=attempt=>!!attempt&&(attempt.choice.infoHash?attempt.evidence.verified>0:attempt.evidence.video&&attempt.evidence.bytes>0);
+  const makeFailure=()=>failure(primary.infoHash?'NO_USEFUL_PIECES':'HTTP_STALL',primary.infoHash?'No verified episode data within the source search window':'No valid HTTP video payload within the source search window');
+  const terminalFailure=()=>original.result?.error&&original.result.error.code!=='TEST_INCONCLUSIVE'?original.result.error:makeFailure();
+  const test=async(limitMs,mode)=>{
     const session=new AbortController();const testSignal=AbortSignal.any([combined,session.signal]);
-    const comparisonTimer=setTimeout(()=>session.abort(testStopped('Source comparison time limit reached')),comparisonLimitMs);
-    const pool=new Set();let finished=0;
-    const workers=candidates.slice(0,2).map(async(choice,index)=>{
+    const comparisonTimer=setTimeout(()=>session.abort(testStopped('Source comparison time limit reached')),Math.max(0,limitMs));
+    let pool=new Set(),finished=0,workerError=null,adoptedWinner=false;
+    const report=(choice,candidate)=>{
+      if(candidate.reported||!candidate.result)return;
+      candidate.reported=true;
+      const qualifies=candidate.evidence.qualifies(!!choice.infoHash),code=candidate.result.error?.code||null;
+      const status=code==='TEST_INCONCLUSIVE'?(qualifies?'working':'inconclusive'):['ENOSPC','VERIFY_UNAVAILABLE','METADATA_TIMEOUT','HTTP_STALL'].includes(code)?'inconclusive':code?'failed':'working';
+      onResult(choice,{status,bytes:candidate.evidence.bytes,verifiedBytes:candidate.evidence.verified,speed:candidate.evidence.score(now()),code});
+    };
+    const runCandidate=async(choice,index)=>{
       let release,candidate;
       try{
-        // Give another stalled episode a chance to reserve its first candidate.
-        if(index)await new Promise(resolve=>setTimeout(resolve,100));
-        if(testSignal.aborted)return;
-        release=await budget.acquire(testSignal,index);
+        release=await budget.acquire(testSignal,Math.floor(index/2));
         if(testSignal.aborted||recovered())return;
-        candidate=own(choice,true);pool.add(candidate);onView('testing',candidate);
+        candidate=own(choice,true);pool.add(candidate);onView('testing',candidate,mode);
         while(!testSignal.aborted&&adopted===original&&!recovered()){
           if(original.result&&!original.result.error)break;
-          if(candidate.result){
-            const qualifies=candidate.evidence.qualifies(!!choice.infoHash);
-            const code=candidate.result.error?.code||null;
-            const status=code==='TEST_INCONCLUSIVE'?(qualifies?'working':'inconclusive'):['ENOSPC','VERIFY_UNAVAILABLE','METADATA_TIMEOUT','HTTP_STALL'].includes(code)?'inconclusive':'failed';
-            onResult(choice,{status,bytes:candidate.evidence.bytes,verifiedBytes:candidate.evidence.verified,speed:candidate.evidence.score(now()),code});
-            break;
-          }
+          if(candidate.result){report(choice,candidate);break;}
           await new Promise(resolve=>setTimeout(resolve,100));
         }
-      }catch(error){if(!testSignal.aborted)throw error;}
+      }catch(error){if(!testSignal.aborted)workerError=error;}
       finally{
         if(candidate&&candidate!==adopted){candidate.cancel();await candidate.promise.catch(()=>{});active.delete(candidate);}
+        if(candidate)report(choice,candidate);
         pool.delete(candidate);release?.();finished++;
       }
-    });
-    const all=Promise.allSettled(workers);
+    };
     try{
-      while(!combined.aborted&&finished<workers.length&&!recovered()){
-        if(original.result&&!original.result.error)break;
-        const qualified=[...pool].filter(a=>a.evidence.qualifies(!!a.choice.infoHash)&&!a.result?.error);
-        qualified.sort((a,b)=>(b.choice.res||0)-(a.choice.res||0)||b.evidence.score(now())-a.evidence.score(now()));
-        const best=qualified.find(clearsSwitchThreshold);
-        const preferredPending=best&&[...pool].some(a=>(a.choice.res||0)>(best.choice.res||0)&&!a.result&&!a.evidence.qualifies(!!a.choice.infoHash));
-        if(best&&!preferredPending&&original.job.stage!=='Checking video and audio'&&original.job.stage!=='Verifying replacement'){
-          const measuredAt=now(),currentRate=rateOf(original),candidateRate=best.evidence.score(measuredAt);
-          onResult(primary,{status:'slow',comparisonConfirmed:true,bytes:original.evidence.bytes,speed:currentRate,comparedAt:measuredAt});
-          onResult(best.choice,{status:'working',comparisonConfirmed:true,bytes:best.evidence.bytes,verifiedBytes:best.evidence.verified,speed:candidateRate,comparedAt:measuredAt});
-          onView('switching',best);
-          original.cancel();await original.promise.catch(()=>{});
-          if(original.result&&!original.result.error)break;
-          adopted=best;best.promote();break;
-        }
-        await new Promise(resolve=>setTimeout(resolve,100));
+      const candidateCount=mode==='slow'?Math.min(2,candidates.length):candidates.length;
+      for(let offset=0;offset<candidateCount&&!testSignal.aborted&&!recovered();){
+        const wave=[candidates[offset]];
+        let end=offset+1;
+        // Never probe a lower quality while an eligible requested-quality
+        // release in this turn is still being tested.
+        while(end<candidateCount&&wave.length<2&&candidates[end].res===wave[0].res){wave.push(candidates[end]);end++;}
+        pool=new Set();finished=0;
+        const workers=wave.map((choice,index)=>runCandidate(choice,offset+index));
+        const all=Promise.allSettled(workers);
+        try{
+          while(!testSignal.aborted&&finished<workers.length&&!recovered()){
+            if(original.result&&!original.result.error)break;
+            const qualified=[...pool].filter(a=>a.evidence.qualifies(!!a.choice.infoHash)&&!a.result?.error);
+            qualified.sort((a,b)=>(b.choice.res||0)-(a.choice.res||0)||b.evidence.score(now())-a.evidence.score(now()));
+            const best=qualified.find(clearsSwitchThreshold);
+            if(best&&original.job.stage!=='Checking video and audio'&&original.job.stage!=='Verifying replacement'){
+              const measuredAt=now(),currentRate=rateOf(original),candidateRate=best.evidence.score(measuredAt);
+              if(hasUsefulData(original))onResult(primary,{status:'slow',comparisonConfirmed:true,bytes:original.evidence.bytes,verifiedBytes:original.evidence.verified,speed:currentRate,comparedAt:measuredAt});
+              best.reported=true;onResult(best.choice,{status:'working',comparisonConfirmed:true,bytes:best.evidence.bytes,verifiedBytes:best.evidence.verified,speed:candidateRate,comparedAt:measuredAt});
+              onView('switching',best);
+              if(!original.result){original.cancel();await original.promise.catch(()=>{});}
+              if(original.result&&!original.result.error)break;
+              adopted=best;best.promote();adoptedWinner=true;break;
+            }
+            await new Promise(resolve=>setTimeout(resolve,100));
+          }
+        }finally{await all;}
+        if(workerError||adoptedWinner||original.result&&!original.result.error||recovered())break;
+        offset=end;
       }
     }finally{
       session.abort(testStopped('Comparison sampling finished'));
       clearTimeout(comparisonTimer);
-      const results=await all;
-      const failed=results.find(r=>r.status==='rejected');if(failed&&!combined.aborted)throw failed.reason;
       testDone=true;
     }
+    if(workerError&&!combined.aborted)throw workerError;
   };
 
   try{
@@ -141,19 +157,31 @@ export async function compareSources({signal,primary,candidates,start,budget,now
       if(testing&&testDone&&recovered()){testing=false;testDone=false;testTask=null;recoveryStart=null;triggerMode=null;}
       if(!testing&&(idleDue||slowDue)){
         triggerMode=slowDue?'slow':'idle';
-        if(candidates.length){testing=true;recoveryStart=now();recoveryVerified=original.evidence.verified;testTask=test().catch(error=>{if(!combined.aborted)stop=error;testDone=true;});}
-        else if(triggerMode==='slow'&&shouldYield(original.job)){original.cancel();await original.promise.catch(()=>{});return {yielded:true,attempt:original,switched:false};}
+        if(candidates.length){
+          if(triggerMode==='idle'&&sourceTurnDeadline!==null&&now()>=sourceTurnDeadline){original.cancel();await original.promise.catch(()=>{});throw terminalFailure();}
+          testing=true;recoveryStart=now();recoveryVerified=original.evidence.verified;
+          const limit=triggerMode==='idle'&&sourceTurnDeadline!==null?Math.max(0,sourceTurnDeadline-now()):comparisonLimitMs;
+          testTask=test(limit,triggerMode).catch(error=>{if(!combined.aborted)stop=error;testDone=true;});
+        }else if(triggerMode==='slow'&&shouldYield(original.job)){original.cancel();await original.promise.catch(()=>{});return {yielded:true,attempt:original,switched:false};}
       }
       if(testing&&testDone&&triggerMode==='slow'&&!recovered()&&shouldYield(original.job)){
         original.cancel();await original.promise.catch(()=>{});return {yielded:true,attempt:original,switched:false};
       }
       if(stop)throw stop;
-      if(original.result?.error&&(!testing||testDone))throw original.result.error;
-      if(!original.result&&idle>=noDataLimitMs){
-        original.cancel();await original.promise.catch(()=>{});
-        throw failure(primary.infoHash?'NO_USEFUL_PIECES':'HTTP_STALL',primary.infoHash?'No verified episode data within 45 seconds':'No valid HTTP video payload within 45 seconds');
+      if(original.result?.error&&(!testing||testDone)){
+        if(original.result.error.code==='TEST_INCONCLUSIVE'&&!hasUsefulData(original))throw terminalFailure();
+        throw original.result.error;
       }
-      onView(testing&&!testDone?'testing':'primary',adopted);
+      const useful=hasUsefulData(original);
+      if(!useful&&sourceTurnDeadline!==null&&now()>=sourceTurnDeadline&&(!testing||testDone)){
+        if(!original.result){original.cancel();await original.promise.catch(()=>{});}
+        throw terminalFailure();
+      }
+      if(!original.result&&sourceTurnDeadline===null&&idle>=noDataLimitMs){
+        original.cancel();await original.promise.catch(()=>{});
+        throw makeFailure();
+      }
+      onView(testing&&!testDone?'testing':'primary',adopted,triggerMode);
       await new Promise(resolve=>setTimeout(resolve,100));
     }
   }finally{

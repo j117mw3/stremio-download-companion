@@ -1,4 +1,4 @@
-import {ExtraBudget,ConnectivityEvidence,compareSources,verifiedFileBytes,probeSelection,TEST_LIMIT,testStopped} from './source-testing.js';
+import {ExtraBudget,ConnectivityEvidence,compareSources,verifiedFileBytes,probeSelection,TEST_LIMIT,testStopped,MAX_SOURCE_TURN_SOURCES,SOURCE_TURN_LIMIT_MS} from './source-testing.js';
 import {failure, prepareTorrent, selectFile, FileProgress, RETRY_DELAYS, DEFERRED_RETRY_DELAYS, SOURCE_FAILURES} from './transfer-state.js';
 import {findExisting, verifyExisting, fingerprint} from './existing.js';
 import { finalize } from './finalize.js';
@@ -112,6 +112,7 @@ export class Downloader {
     let migrated=false;
     for(const [index,job] of this.jobs.entries()){
       job.queueOrder=Number.isFinite(job.queueOrder)?job.queueOrder:index+1;this.queueSequence=Math.max(this.queueSequence,job.queueOrder);job.comparison=null;job.isProbe=false;
+      if(job.sourceSearch?.phase==='searching')job.sourceSearch={...job.sourceSearch,phase:'interrupted'};
       if(job.status==='needs_attention'&&SOURCE_FAILURES.has(job.failureCode)){
         job.status='deferred';job.retryRound=Math.max(RETRY_DELAYS.length,Number(job.retryRound)||0);job.deferredRetryRound=0;
         job.nextRetryAt=this.now()+DEFERRED_RETRY_DELAYS[0];job.stage='Deferred retry scheduled';job.backgroundRetryActive=false;migrated=true;
@@ -197,14 +198,22 @@ export class Downloader {
   }
 
   historyKey(source) {
-    if(source.url){let host='';try{host=new URL(source.url).hostname.toLowerCase();}catch{}if(host)return createHash('sha256').update('host:'+host).digest('hex');}
     if(source.infoHash)return createHash('sha256').update('torrent:'+String(source.infoHash).toLowerCase()).digest('hex');
+    if(source.url){let host='';try{host=new URL(source.url).hostname.toLowerCase();}catch{}if(host)return createHash('sha256').update('host:'+host).digest('hex');}
     return this.sourceKey(source);
   }
 
   sourceResult(source) {
     const result=this.sourceResults?.[this.historyKey(source)];
     return result?.expires>this.now()?result:null;
+  }
+
+  recordSourceResult(job,source,outcome) {
+    const key=this.historyKey(source),now=this.now();
+    this.sourceResults||={};
+    this.sourceResults[key]={...outcome,time:now,expires:now+15*60000,swarmKey:key,seriesKey:createHash('sha256').update(String(job.series)).digest('hex')};
+    for(const [entry,value] of Object.entries(this.sourceResults))if(value.expires<now)delete this.sourceResults[entry];
+    this.save();
   }
 
   available(job,source) {
@@ -350,6 +359,8 @@ export class Downloader {
       const choiceOptions = { mode, connectivityScore:source=>this.connectivityScore(job,source), preferHashes: hashes, allowedResolutions:job.profile?.allowedResolutions, maxResolution: job.profile?.resolution || cfg.maxResolution };
       const preferredSource = job.sourceOverride && streams.find(s => createHash('sha256').update(JSON.stringify([s.infoHash,s.fileIdx,s.url])).digest('hex')===job.sourceOverride);
       const attemptedSources=new Set();
+      const sourceTurnStartedAt=this.now(),sourceTurnDeadline=sourceTurnStartedAt+SOURCE_TURN_LIMIT_MS;
+      job.sourceSearch={startedAt:sourceTurnStartedAt,deadlineAt:sourceTurnDeadline,elapsedSeconds:0,limitSeconds:SOURCE_TURN_LIMIT_MS/1000,attempted:0,maxSources:MAX_SOURCE_TURN_SOURCES,phase:'searching'};
       const choose=sources=>{
         const untried=sources.filter(raw=>!attemptedSources.has(this.turnIdentity(parseStream(raw))));
         const fresh=untried.filter(raw=>!job.recentSources?.includes(this.sourceKey(parseStream(raw))));
@@ -371,46 +382,53 @@ export class Downloader {
       const prefix = `S${pad(job.season)}E${pad(job.episode)} - `;
 
       job.attempts ||= [];
+      let completedThisTurn=false,sourceTurnFailure=null;
       while(choice) {
         controller.signal.throwIfAborted();
+        if(this.now()>=sourceTurnDeadline||attemptedSources.size>=MAX_SOURCE_TURN_SOURCES)break;
         const identity=this.turnIdentity(choice);
-        if(!attemptedSources.has(identity)&&attemptedSources.size>=3)break;
         attemptedSources.add(identity);
+        job.sourceSearch.attempted=attemptedSources.size;job.sourceSearch.elapsedSeconds=Math.floor((this.now()-sourceTurnStartedAt)/1000);
         job.speed=0;job.torrentSpeed=0;job.progress=0;
         job.release=choice.title;job.sourceProviders=choice.addonNames||[];job.quality=choice.res?`${choice.res}p`:'?';
         try {
-          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix,attemptedSources);
-          if(choice.infoHash)hashes.add(choice.infoHash);
+          job.file=await this.downloadWithComparison(job,choice,streams,choiceOptions,dir,prefix,attemptedSources,sourceTurnDeadline);
+          completedThisTurn=true;
           break;
         }catch(e){
+          sourceTurnFailure=e;
           if(e.sourceChoice)choice=e.sourceChoice;
           if(controller.signal.aborted||!SOURCE_FAILURES.has(e.code))throw e;
+          if(!job.sourceSearch.lastCode||job.sourceSearch.lastCode!==e.code)job.sourceSearch.lastCode=e.code;
           this.cool(job,choice,e);
           job.recentSources=[...(job.recentSources||[]).filter(key=>key!==this.sourceKey(choice)),this.sourceKey(choice)].slice(-100);
           job.attempts.push({source:choice.title,providers:choice.addonNames||[],attempt:1,code:e.code,error:e.message,time:this.now()});
           job.attempts=job.attempts.slice(-100);this.save();
           streams=streams.filter(raw=>this.turnIdentity(parseStream(raw))!==identity&&this.available(job,parseStream(raw)));
           const next=choose(streams);
-          if(!next||(!attemptedSources.has(this.turnIdentity(next))&&attemptedSources.size>=3))throw e;
-          choice=next;job.fallbackReason='Previous source failed';job.stage='Trying another source';
+          if(!next||this.now()>=sourceTurnDeadline||(!attemptedSources.has(this.turnIdentity(next))&&attemptedSources.size>=MAX_SOURCE_TURN_SOURCES))throw e;
+          choice=next;job.fallbackReason='Previous source failed';job.stage='Trying another source';job.sourceSearch.phase='searching';
         }
       }
+      if(!completedThisTurn)throw sourceTurnFailure||failure('NO_USEFUL_PIECES','Source search reached its 60-second limit without verified episode data');
       if(job.verification?.resolution)job.quality=job.verification.resolution+'p';
       job.retryRound=0;job.deferredRetryRound=0;job.backgroundRetryActive=false;job.failureCode=null;job.nextRetryAt=null;job.torrentSpeed=0;
       job.stage='Complete';
       job.status = 'done';
       job.progress = 1;
       job.speed = 0;
+      if(job.sourceSearch)job.sourceSearch.phase='complete';
     } catch (e) {
       if(e.code==='YIELD_TRANSFER'&&!controller.signal.aborted){job.status='queued';job.backgroundRetryActive=false;job.yieldedAt=this.now();job.queueOrder=this.nextQueueOrder();job.stage='Waiting behind other downloads';job.error=null;job.failureCode=null;job.speed=0;}
       else if (!['paused','cancelled','queued'].includes(job.status)){
         if(!controller.signal.aborted&&SOURCE_FAILURES.has(e.code))this.defer(job,e);
         else {job.status=e.code==='ENOSPC'?'paused':'failed';job.failureCode=e.code||'LOCAL_FAILURE';}
       }
+      if(job.sourceSearch){job.sourceSearch.phase=job.status==='queued'?'yielded':job.status==='retry_wait'||job.status==='deferred'?'retry_scheduled':job.status==='paused'||job.status==='cancelled'?'stopped':'failed';job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}
       if(controller.signal.aborted&&['paused','cancelled'].includes(job.status))job.backgroundRetryActive=false;
       job.error = e.code==='YIELD_TRANSFER'||controller.signal.aborted ? null : e.message;
       job.speed = 0;
-    } finally {job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;job.backgroundRetryActive=false;this.controllers.delete(job.id);}
+    } finally {if(job.sourceSearch){if(job.sourceSearch.phase==='searching')job.sourceSearch.phase=job.status==='done'?'complete':'ended';job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}job.speed=0;job.torrentSpeed=0;job.isProbe=false;job.comparison=null;job.backgroundRetryActive=false;this.controllers.delete(job.id);}
   }
 
   startAttempt(parent,choice,probe,ownerSignal,dir,prefix) {
@@ -447,48 +465,63 @@ export class Downloader {
     return attempt;
   }
 
-  async downloadWithComparison(job,choice,streams,options,dir,prefix,attemptedSources=new Set()) {
+  async downloadWithComparison(job,choice,streams,options,dir,prefix,attemptedSources=new Set(),sourceTurnDeadline=null) {
     this.extraBudget||=new ExtraBudget(2);this.sourceResults||={};
     const candidates=[];const seen=new Set([choice.url?'url:'+choice.url:'torrent:'+choice.infoHash]);
     let remaining=streams.filter(raw=>this.available(job,parseStream(raw)));
-    while(remaining.length&&candidates.length<Math.min(2,Math.max(0,3-attemptedSources.size))){
-      const target=remaining.filter(raw=>parseStream(raw).res===job.profile?.resolution);
-      const selected=pickBest(target,options)||pickBest(remaining,options);if(!selected)break;
-      remaining=remaining.filter(raw=>raw!==selected.raw);
-      const identity=selected.url?'url:'+selected.url:'torrent:'+selected.infoHash;
-      if(seen.has(identity)||!selected.res||attemptedSources.has(this.turnIdentity(selected)))continue;seen.add(identity);candidates.push(selected);
+    const candidateLimit=Math.min(MAX_SOURCE_TURN_SOURCES-1,Math.max(0,MAX_SOURCE_TURN_SOURCES-attemptedSources.size));
+    const resolutions=[...new Set(remaining.map(raw=>parseStream(raw).res).filter(Boolean))];
+    const requested=Number(job.profile?.resolution)||0;
+    resolutions.sort((a,b)=>Number(b===requested)-Number(a===requested)||b-a);
+    for(const resolution of resolutions){
+      let tier=remaining.filter(raw=>parseStream(raw).res===resolution);
+      while(tier.length&&candidates.length<candidateLimit){
+        const selected=pickBest(tier,options);if(!selected)break;
+        tier=tier.filter(raw=>raw!==selected.raw);remaining=remaining.filter(raw=>raw!==selected.raw);
+        const identity=selected.url?'url:'+selected.url:'torrent:'+selected.infoHash;
+        if(seen.has(identity)||attemptedSources.has(this.turnIdentity(selected)))continue;seen.add(identity);candidates.push(selected);
+      }
+      if(candidates.length>=candidateLimit)break;
     }
     const signal=this.controllers.get(job.id).signal;
     const sync=attempt=>{
       for(const key of ['progress','speed','rollingSpeed','torrentSpeed','peers','downloadedBytes','idleSeconds','lastProgressAt','stage','totalBytes','sourceWaitStartedAt','waitLimitSeconds','metadataWaitStartedAt','sourceResponseAt','dataStartedAt'])job[key]=attempt.job[key];
+      if(job.sourceSearch?.phase==='searching'&&attempt.job.lastProgressAt)job.sourceSearch.phase='transferring';
     };
     const tested=[];
     const result=await compareSources({signal,primary:choice,candidates,budget:this.extraBudget,now:()=>this.now(),
       start:(source,probe,owner)=>{
-        if(probe)attemptedSources.add(this.turnIdentity(source));
+        if(probe){attemptedSources.add(this.turnIdentity(source));if(job.sourceSearch){job.sourceSearch.attempted=attemptedSources.size;job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);}}
         const attempt=this.startAttempt(job,source,probe,owner,dir,prefix);
         if(probe)tested.push(attempt);
         return attempt;
       },
-      onView:(phase,attempt)=>{
+      onView:(phase,attempt,comparisonMode)=>{
         if(!attempt.probe)sync(attempt);
-        job.comparison=phase==='testing'?{status:'testing',startedAt:tested[0]?.started||this.now(),elapsedSeconds:Math.floor((this.now()-(tested[0]?.started||this.now()))/1000),limitSeconds:30,primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,elapsedSeconds:Math.floor((this.now()-test.started)/1000),limitSeconds:30,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now())}))}:null;
+        if(phase==='testing'&&comparisonMode==='idle'&&job.sourceSearch)job.sourceSearch.phase='searching';
+        if(job.sourceSearch){job.sourceSearch.elapsedSeconds=Math.floor((this.now()-job.sourceSearch.startedAt)/1000);job.sourceSearch.attempted=attemptedSources.size;}
+        const comparisonLimit=comparisonMode==='slow'||sourceTurnDeadline===null?30:Math.max(0,Math.ceil((sourceTurnDeadline-(tested[0]?.started||this.now()))/1000));
+        job.comparison=phase==='testing'?{status:'testing',startedAt:tested[0]?.started||this.now(),elapsedSeconds:Math.floor((this.now()-(tested[0]?.started||this.now()))/1000),limitSeconds:comparisonLimit,primaryRate:job.rollingSpeed||0,candidates:tested.map(test=>({key:this.sourceKey(test.choice),bytes:test.evidence.bytes,verifiedBytes:test.evidence.verified,ready:test.evidence.ready,elapsedSeconds:Math.floor((this.now()-test.started)/1000),limitSeconds:30,rate:test.evidence.score(this.now()),score:test.evidence.score(this.now())}))}:null;
         if(phase==='testing')job.stage='Checking for a faster source';
         if(phase==='switching'){job.release=attempt.choice.title;job.sourceProviders=attempt.choice.addonNames||[];job.quality=attempt.choice.res?attempt.choice.res+'p':'?';job.stage='Switching to a verified working source';job.switchNote='Different release selected; percentage reflects this release. Previous partial download retained.';}
       },
       onResult:(source,outcome)=>{
-        const key=this.historyKey(source);this.sourceResults[key]={...outcome,time:this.now(),expires:this.now()+15*60000,swarmKey:key,seriesKey:createHash('sha256').update(String(job.series)).digest('hex')};
-        for(const [key,value] of Object.entries(this.sourceResults))if(value.expires<this.now())delete this.sourceResults[key];
-        this.save();
+        this.recordSourceResult(job,source,outcome);
       },
       shouldCompare:()=>this.slowComparisonDue(job),
       isRecovered:()=>this.originalRecovered(job),
       shouldYield:()=>this.hasReadyWork(job.id),
-      shouldSwitch:({currentRate,candidateRate})=>candidateRate>=currentRate*2&&candidateRate-currentRate>=LOW_RATE
+      shouldSwitch:({currentRate,candidateRate})=>candidateRate>=currentRate*2&&candidateRate-currentRate>=LOW_RATE,
+      sourceTurnDeadline
     });
     if(result.yielded)throw failure('YIELD_TRANSFER','Waiting behind other downloads');
     Object.assign(job,{verification:result.attempt.job.verification,release:result.attempt.choice.title,sourceProviders:result.attempt.choice.addonNames||[],quality:result.attempt.choice.res?result.attempt.choice.res+'p':'?',comparison:null});
     job.replacement=result.attempt.job.replacement;
+    const evidence=result.attempt.evidence;
+    const usefulBytes=result.attempt.choice.infoHash?evidence.verified:evidence.video?evidence.bytes:0;
+    const usefulRate=evidence.score(this.now());
+    if(usefulBytes>0&&usefulRate>0)this.recordSourceResult(job,result.attempt.choice,{status:'working',verifiedDownload:true,bytes:evidence.bytes,verifiedBytes:evidence.verified,speed:usefulRate,completedAt:this.now()});
+    if(result.attempt.choice.infoHash){const seasonKey=`${job.series}|${job.season}`;this.seasonHashes.get(seasonKey)?.add(result.attempt.choice.infoHash);}
     return result.file;
   }
 
@@ -548,14 +581,14 @@ export class Downloader {
     const meter=new FileProgress(got,this.now());
     speedTimer=setInterval(()=>{const sample=meter.sample(got,this.now());job.speed=sample.speed;job.rollingSpeed=sample.rollingSpeed;if(!context?.attempt.probe)this.updateSlowState(job);},1000);
     const body = Readable.fromWeb(res.body);
-    body.on('data', (chunk) => {
+      body.on('data', (chunk) => {
       resetIdle();
       got += chunk.length;
       if(header.length<512)header=Buffer.concat([header,chunk.subarray(0,512-header.length)]);
       const sniff=header.subarray(0,4).toString('hex')==='1a45dfa3'||header.subarray(4,8).toString()==='ftyp'||header.subarray(0,4).toString()==='RIFF'||header[0]===0x47;
       const video=sniff||(videoType&&!/^\s*(?:<|\{|\[)/.test(header.toString()));
-      context?.observe(got,0,total>0&&got===total,video);
-      job.lastProgressAt=this.now();job.idleSeconds=0;job.downloadedBytes=got;
+        context?.observe(got,0,total>0&&got===total,video);
+        if(video)job.lastProgressAt=this.now();job.idleSeconds=video?0:Math.floor((this.now()-(job.lastProgressAt??job.dataStartedAt??context?.attempt.started??this.now()))/1000);job.downloadedBytes=got;
       if (total) job.progress = got / total;
 
     });
@@ -648,6 +681,7 @@ export class Downloader {
     try { e = await this.acquire(c,this.controllers.get(job.id)?.signal); }
     finally { clearInterval(peerMonitor); }
     job.metadataWaitStartedAt=null;job.sourceResponseAt=this.now();
+    job.dataStartedAt??=this.now();
     job.peers=e.torrent?.numPeers||0;
     job.stage='Downloading video';
     let unselect,windowSelection;
@@ -673,18 +707,21 @@ export class Downloader {
         const poll=()=>{
           if(signal?.aborted)return abort();
           if(t.destroyed)return finish(failure('TORRENT_FAILURE','Torrent connection closed'));
-          const sample=progress.sample(file.downloaded,this.now());
+          const pollNow=this.now(),sample=progress.sample(file.downloaded,pollNow);
           const verified=verifiedFileBytes(t,file);
+          const previouslyVerified=context?.attempt.evidence.verified||0;
           context?.observe(file.downloaded,verified,verified>=file.length);
+          const newVerified=Math.max(0,verified-(context?.verifiedBaseline||0));
+          if(context&&newVerified>previouslyVerified)job.lastProgressAt=pollNow;
           if(context?.adopted&&windowSelection){windowSelection.release();windowSelection=null;unselect=selectFile(e,file);}
           else if(context?.capped)windowSelection?.release();else windowSelection?.advance();
           job.progress=file.progress;job.speed=sample.speed;job.rollingSpeed=sample.rollingSpeed;job.torrentSpeed=t.downloadSpeed;job.peers=t.numPeers;
           if(!context?.attempt.probe)this.updateSlowState(job);
-          job.downloadedBytes=file.downloaded;job.idleSeconds=Math.floor(sample.idleMs/1000);
-          if(sample.speed>0)job.lastProgressAt=this.now();
-          job.stage=sample.idleMs>=1000?'Waiting for useful pieces':'Downloading video';
+          const usefulIdleMs=pollNow-(job.lastProgressAt??job.dataStartedAt??context?.attempt.started??job.runStartedAt??pollNow);
+          job.downloadedBytes=file.downloaded;job.idleSeconds=Math.floor(usefulIdleMs/1000);
+          job.stage=usefulIdleMs>=1000?'Waiting for useful pieces':'Downloading video';
           if(file.progress>=1&&(!t.bitfield||verified>=file.length))return finish();
-          if(sample.idleMs>=45000)finish(failure('NO_USEFUL_PIECES','No verified episode data within 45 seconds'));
+          if(usefulIdleMs>=45000)finish(failure('NO_USEFUL_PIECES','No verified episode data within 45 seconds'));
         };
         t.on('error',onError);signal?.addEventListener('abort',abort,{once:true});
         iv=setInterval(poll,1000);poll();

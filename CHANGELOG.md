@@ -64,3 +64,10 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Replace terminal source failures with persisted deferred retries after the existing 5, 15, and 60-minute cycle: 30 minutes, one hour, then every two hours.
 - Run at most one deferred retry at a time and only after fresh queued work drains; migrate source-related Needs attention jobs into this retry path.
 - Show source wait, metadata wait, comparison progress, and deferred retry timing in queue feedback and job responses.
+
+## 0.4.13
+
+- Search up to five distinct releases, including the initial source, within a 60-second no-data turn; retain the 15-second metadata timeout, two-test budget, 30-second candidate cap, and 16 MiB test cap.
+- Test requested-quality releases before explicitly permitted lower-quality fallbacks, and count only verified torrent episode bytes or valid HTTP video payload as useful connectivity.
+- Rank otherwise eligible releases using short-lived throughput from verified downloads and source comparisons; keep torrent history keyed by swarm and HTTP history keyed by a hashed hostname.
+- Show source-turn progress, candidate rates, and remaining search time in the queue while preserving retry behavior, partial downloads, and quality/audio restrictions.
