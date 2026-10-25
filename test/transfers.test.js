@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { Downloader } from '../src/downloader.js';
+import { Downloader, torrentEpisodeFile } from '../src/downloader.js';
 test('HTTP transfer preserves bytes and never overwrites completed output',async()=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'companion-test-'));
  const data=Buffer.from('fixture-video-bytes');
@@ -13,6 +13,57 @@ test('HTTP transfer preserves bytes and never overwrites completed output',async
  const d=Object.create(Downloader.prototype);d.inspectMedia=async()=>({fixture:true});d.controllers=new Map([['fixture',new AbortController()]]);
  const c={url:`http://127.0.0.1:${server.address().port}/video.mp4`,filename:'video.mp4',raw:{}};
  try{const file=await d.downloadHttp({id:'fixture'},c,dir,'S01E01 - ');assert.deepEqual(fs.readFileSync(file),data);await assert.rejects(d.downloadHttp({id:'fixture'},c,dir,'S01E01 - '),{code:'EEXIST'});assert.deepEqual(fs.readFileSync(file),data)}finally{await new Promise(r=>server.close(r));fs.rmSync(dir,{recursive:true,force:true})}
+});
+test('a wrong torrent fileIdx falls back to a unique episode filename and rejects ambiguity',()=>{
+ const job={season:1,episode:2};
+ const files=[{path:'Show/Show.S01E01.mkv'},{path:'Show/Show.S01E02.mkv'}];
+ assert.equal(torrentEpisodeFile({files},{fileIdx:0,filename:'Show.S01E02.mkv'},job),files[1]);
+ const ambiguous=[{path:'disc1/Show.S01E02.mkv'},{path:'disc2/Show.S01E02.mkv'},{path:'Show/Show.S01E01.mkv'}];
+ assert.equal(torrentEpisodeFile({files:ambiguous},{fileIdx:2,filename:'Show.S01E02.mkv'},job),null);
+ assert.equal(torrentEpisodeFile({files},{fileIdx:0},job),files[1]);
+});
+
+test('verified torrent staging cleanup waits for the final shared reference and deletes only the matching file',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'staging-cleanup-')),hash='f'.repeat(40),tmp=path.join(root,'.tmp',hash),output=path.join(root,'Show','Season 01');fs.mkdirSync(tmp,{recursive:true});fs.mkdirSync(output,{recursive:true});
+ const staged=path.join(tmp,'Show.S01E01.mkv'),unrelated=path.join(tmp,'Show.S01E02.mkv'),destination=path.join(output,'Show - S01E01 - Pilot.mkv'),contents=Buffer.from('verified-media-bytes');fs.writeFileSync(staged,contents);fs.writeFileSync(unrelated,'keep this partial');fs.writeFileSync(destination,contents);
+ const d=Object.create(Downloader.prototype),entry={refs:2,tmp,torrent:{destroy(){this.destroyed=true;}},cleanupFiles:new Set()};d.torrents=new Map([[hash,entry]]);
+ try{
+  await d.stageVerifiedCleanup(entry,staged,destination);d.release(hash);assert.equal(fs.existsSync(staged),true);assert.equal(fs.existsSync(unrelated),true);assert.equal(entry.torrent.destroyed,undefined);
+  d.torrents.set(hash,entry);d.release(hash);assert.equal(fs.existsSync(staged),false);assert.equal(fs.existsSync(unrelated),true);assert.deepEqual(fs.readFileSync(destination),contents);assert.equal(entry.torrent.destroyed,true);
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('failed copy verification and paths outside a torrent cache preserve staged files',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'staging-preserve-')),tmp=path.join(root,'.tmp','hash');fs.mkdirSync(tmp,{recursive:true});
+ const staged=path.join(tmp,'episode.mkv'),destination=path.join(root,'final.mkv'),outside=path.join(root,'outside.mkv');fs.writeFileSync(staged,'source bytes');fs.writeFileSync(destination,'different destination');fs.writeFileSync(outside,'unrelated');
+ const d=Object.create(Downloader.prototype),entry={tmp};
+ try{
+  await assert.rejects(d.stageVerifiedCleanup(entry,staged,destination),{code:'FINALIZE_VERIFY_FAILED'});await assert.rejects(d.stageVerifiedCleanup(entry,outside,destination),{code:'FINALIZE_VERIFY_FAILED'});
+  assert.equal(fs.readFileSync(staged,'utf8'),'source bytes');assert.equal(fs.readFileSync(outside,'utf8'),'unrelated');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('episode source selection starts on a provider batch before the full lookup finishes',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'companion-progressive-'));
+ const source={name:'Fixture 720p',title:'Show.S01E01.720p',infoHash:'e'.repeat(40),fileIdx:0,providerIds:['p-'+'a'.repeat(24)]};
+ const d=Object.create(Downloader.prototype);d.controllers=new Map();d.seasonHashes=new Map();d.cooldowns={};d.sourceResults={};d.providerResults={};d.save=()=>{};
+ let lookupResolved=false,selectedBeforeLookupFinished=false;
+ d.streamsFor=(_id,_signal,{onUpdate})=>new Promise(resolve=>{
+  setTimeout(()=>onUpdate({streams:[source],diagnostics:[{status:'ok'}],completed:1,providerCount:60,done:false}),5);
+  setTimeout(()=>{lookupResolved=true;resolve([source]);},80);
+ });
+ d.downloadWithComparison=async()=>{selectedBeforeLookupFinished=!lookupResolved;return 'verified.mkv';};
+ const job={id:'tt0000001:1:1',series:'tt0000001',seriesName:'Show',title:'Episode',kind:'imdb',season:1,episode:1,status:'queued',profile:{downloadDir:root,resolution:720,allowedResolutions:[720],english:false}};
+ try{await d.run(job);assert.equal(job.status,'done',job.error);assert.equal(selectedBeforeLookupFinished,true);assert.equal(job.sourceDiscovery.providerCount,60);}
+ finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+test('English audio preference does not block a release when it is the only source',async()=>{
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'companion-audio-preference-'));
+ const source={name:'Fixture 720p',title:'Show.S01E01.720p.GERMAN',infoHash:'d'.repeat(40),fileIdx:0};
+ const d=Object.create(Downloader.prototype);d.controllers=new Map();d.seasonHashes=new Map();d.cooldowns={};d.sourceResults={};d.providerResults={};d.save=()=>{};d.available=()=>true;d.streamsFor=async()=>[source];let selected=null;
+ d.downloadWithComparison=async(_job,choice)=>{selected=choice;return 'verified.mkv';};
+ const job={id:'tt0000001:1:1',series:'tt0000001',seriesName:'Show',title:'Episode',kind:'imdb',season:1,episode:1,status:'queued',profile:{downloadDir:root,resolution:720,allowedResolutions:[720],english:true}};
+ try{await d.run(job);assert.equal(job.status,'done',job.error);assert.equal(selected?.title,source.title);assert.equal(selected?.dub,false);}
+ finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 test('cancel preserves job and prevents resume while transfer is stopping',()=>{
  const d=Object.create(Downloader.prototype);const controller=new AbortController();d.controllers=new Map([['a',controller]]);d.jobs=[{id:'a',status:'downloading'}];d.save=()=>{};d.pump=()=>{};
@@ -26,7 +77,7 @@ test('metadata cancellation releases acquisition instead of waiting for timeout'
  await assert.rejects(pending,/Stopped/);assert.ok(released);
 });
 test('startup recovers interrupted jobs and preserves paused jobs',()=>{
- const d=Object.create(Downloader.prototype);d.store={read:()=>[{id:'a',status:'downloading'},{id:'b',status:'paused'}]};d.pump=()=>{};d.load();assert.equal(d.jobs[0].status,'queued');assert.equal(d.jobs[1].status,'paused');
+ const d=Object.create(Downloader.prototype);d.store={read:()=>[{id:'a',status:'downloading'},{id:'b',status:'paused'}],write:()=>{}};d.save=()=>{};d.pump=()=>{};d.load();assert.equal(d.jobs[0].status,'queued');assert.equal(d.jobs[1].status,'paused');
 });
 test('torrent metadata and no-progress failures switch to the next eligible release',async()=>{
  const {createHash}=await import('node:crypto');
@@ -35,10 +86,16 @@ test('torrent metadata and no-progress failures switch to the next eligible rele
   const first={name:'Torrentio\n720p',title:'Dead.S01E01.720p',infoHash:'a'.repeat(40),fileIdx:0};
   const second={name:'Torrentio\n720p',title:'Live.S01E01.720p',infoHash:'b'.repeat(40),fileIdx:0};
   const sourceOverride=createHash('sha256').update(JSON.stringify([first.infoHash,first.fileIdx,first.url])).digest('hex');
-  const d=Object.create(Downloader.prototype);const tried=[];d.streamsFor=async()=>[first,second];d.downloadTorrent=async(_job,choice)=>{tried.push(choice.title);if(choice.raw===first)throw Object.assign(new Error('source failed'),{code});return 'verified-file'};d.controllers=new Map();d.seasonHashes=new Map();d.save=()=>{};
+  const d=Object.create(Downloader.prototype);const tried=[];d.streamsFor=async()=>[first,second];d.downloadWithComparison=async(_job,choice)=>{tried.push(choice.title);if(choice.raw===first)throw Object.assign(new Error('source failed'),{code});return 'verified-file'};d.controllers=new Map();d.seasonHashes=new Map();d.cooldowns={};d.save=()=>{};
   const job={id:'tt0000001:1:1',profile:{resolution:720,allowedResolutions:[720],english:false,downloadDir:directory},kind:'imdb',series:'tt0000001',seriesName:'Show',title:'Episode',season:1,episode:1,status:'queued',sourceOverride};
-  try{await d.run(job);if(code==='NO_USEFUL_PIECES'){assert.equal(job.status,'retry_wait');assert.deepEqual(tried,['Dead.S01E01.720p']);}else{assert.equal(job.status,'done');assert.deepEqual(tried,['Dead.S01E01.720p','Live.S01E01.720p']);}}finally{fs.rmSync(directory,{recursive:true,force:true});}
+  try{await d.run(job);assert.equal(job.status,'done');assert.deepEqual(tried,['Dead.S01E01.720p','Live.S01E01.720p']);}finally{fs.rmSync(directory,{recursive:true,force:true});}
  }
+});
+test('one scheduling turn attempts no more than five distinct releases',async()=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'companion-five-sources-'));const sources=Array.from({length:8},(_,i)=>({name:'Torrentio\n720p',title:'Source-'+i+'.S01E01.720p',infoHash:String(i+1).repeat(40),fileIdx:0}));
+ const d=Object.create(Downloader.prototype);const tried=[];d.streamsFor=async()=>sources;d.downloadWithComparison=async(_job,choice)=>{tried.push(choice.title);throw Object.assign(new Error('no source data'),{code:'NO_USEFUL_PIECES'});};d.controllers=new Map();d.seasonHashes=new Map();d.cooldowns={};d.save=()=>{};
+ const job={id:'tt0000003:1:1',profile:{resolution:720,allowedResolutions:[720],downloadDir:directory},kind:'imdb',series:'tt0000003',seriesName:'Show',title:'Episode',season:1,episode:1,status:'queued'};
+ try{await d.run(job);assert.equal(job.status,'retry_wait');assert.equal(tried.length,5);assert.equal(new Set(tried).size,5);assert.equal(job.sourceSearch.maxSources,5);assert.equal(job.sourceSearch.attempted,5);}finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 test('shutdown keeps interrupted active jobs queued for restart',async()=>{
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'companion-shutdown-'));

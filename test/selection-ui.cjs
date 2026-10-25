@@ -189,12 +189,18 @@ app.whenReady().then(async () => {
 
   backend.downloader.jobs = [
     {id:'fixture:1:1',seriesName:'Fixture Show',season:1,episode:1,status:'retry_wait',stage:'Retry scheduled',nextRetryAt:Date.now()+300000,speed:0,progress:.2},
-    {id:'fixture:1:2',seriesName:'Fixture Show',season:1,episode:2,status:'downloading',stage:'Waiting for useful pieces',speed:0,torrentSpeed:1048576,peers:4,progress:.1,comparison:{status:'testing',candidates:[{bytes:1048576,verifiedBytes:524288}]}},
-    {id:'fixture:1:3',seriesName:'Fixture Show',season:1,episode:3,status:'needs_attention',stage:'Needs attention',speed:0,progress:0}
+    {id:'fixture:1:2',seriesName:'Fixture Show',season:1,episode:2,status:'downloading',stage:'Checking for a faster source',speed:0,torrentSpeed:1048576,rollingSpeed:180000,peers:4,progress:.1,sourceWaitStartedAt:Date.now()-28000,waitLimitSeconds:45,sourceDiscovery:{phase:'searching',providerCount:60,suppressedCount:5,completed:17,responsive:9,empty:5,timeouts:2,errors:1,releases:4},comparison:{status:'testing',elapsedSeconds:12,primaryRate:180000,candidates:[{bytes:1048576,verifiedBytes:524288,rate:1782579,elapsedSeconds:8,reasonCode:'no_peers'}]}},
+    {id:'fixture:1:3',seriesName:'Fixture Show',season:1,episode:3,status:'needs_attention',stage:'Needs attention',speed:0,progress:0},
+    {id:'fixture:1:4',seriesName:'Fixture Show',season:1,episode:4,status:'queued',stage:'Waiting behind other downloads',speed:0,progress:.3},
+    {id:'fixture:1:5',seriesName:'Fixture Show',season:1,episode:5,status:'downloading',stage:'Waiting for useful pieces',speed:0,rollingSpeed:0,progress:.1},
+    {id:'fixture:1:6',seriesName:'Fixture Show',season:1,episode:6,status:'deferred',stage:'Deferred retry scheduled',nextRetryAt:Date.now()+1800000,speed:0,progress:0,retryClass:'background'},
+    {id:'fixture:1:7',seriesName:'Fixture Show',season:1,episode:7,status:'resolving',stage:'Finding torrent metadata',sourceWaitStartedAt:Date.now()-6000,metadataWaitStartedAt:Date.now()-6000,waitLimitSeconds:45,sourceSearch:{phase:'searching',attempted:3,maxSources:5,startedAt:Date.now()-22000,deadlineAt:Date.now()+38000,elapsedSeconds:22,limitSeconds:60},speed:0,progress:0}
   ];
   await js('tick()');
-  check(await js("document.getElementById('t').textContent.includes('Testing alternative sources') && document.getElementById('t').textContent.includes('1.0 MiB received') && document.getElementById('t').textContent.includes('0.5 MiB verified')"), 'source comparison feedback distinguishes received and verified candidate bytes');
-  check(await js("document.getElementById('t').textContent.includes('Next retry:') && document.getElementById('t').textContent.includes('Waiting for useful pieces') && document.getElementById('t').textContent.includes('Shared torrent traffic: 1.0 MB/s') && document.getElementById('t').textContent.includes('Needs attention') && document.getElementById('t').textContent.includes('0.0 MB/s')"), 'queue distinguishes retry time, stalled episode speed, shared traffic, and Needs attention');
+  check(await js("document.getElementById('t').textContent.includes('Testing alternative sources') && document.getElementById('t').textContent.includes('1.0 MiB received') && document.getElementById('t').textContent.includes('0.5 MiB verified') && document.getElementById('t').textContent.includes('no peers')"), 'source comparison feedback distinguishes received and verified candidate bytes and failure cause');
+  check(await js("document.getElementById('t').textContent.includes('3/5 releases') && /\\d+s left/.test(document.getElementById('t').textContent)"), 'queue shows source-turn progress and remaining search time');
+  check(await js("document.getElementById('t').textContent.includes('Add-on lookup: 17/60 responses') && document.getElementById('t').textContent.includes('9 responsive') && document.getElementById('t').textContent.includes('2 timed out') && document.getElementById('t').textContent.includes('5 cooling down')"), 'queue displays concise progressive add-on lookup diagnostics and cooldowns');
+  check(await js("document.getElementById('t').textContent.includes('Next retry:') && document.getElementById('t').textContent.includes('Deferred retry after ready work:') && document.getElementById('t').textContent.includes('Deferred retry') && document.getElementById('t').textContent.includes('Source wait:') && document.getElementById('t').textContent.includes('/ 45s') && document.getElementById('t').textContent.includes('metadata') && document.getElementById('t').textContent.includes('/ 15s') && document.getElementById('t').textContent.includes('Waiting for useful pieces') && document.getElementById('t').textContent.includes('Checking for a faster source') && document.getElementById('t').textContent.includes('Waiting behind other downloads') && document.getElementById('t').textContent.includes('30s 0.2 MB/s') && document.getElementById('t').textContent.includes('1.7 MB/s') && document.getElementById('t').textContent.includes('Shared torrent traffic: 1.0 MB/s') && document.getElementById('t').textContent.includes('Needs attention') && document.getElementById('t').textContent.includes('0.0 MB/s')"), 'queue displays comparison progress, metadata and source wait, deferred retry timing, yielded jobs, shared traffic, and Needs attention');
   backend.downloader.jobs.push(
     {id:'other:1:1',series:'other',seriesName:'Other Series',season:1,episode:1,status:'done',progress:1},
     {id:'other:1:2',series:'other',seriesName:'Other Series',season:1,episode:2,status:'downloading',progress:.5,speed:1048576},
@@ -203,6 +209,34 @@ app.whenReady().then(async () => {
   await js('tick()');
   check(await js("document.querySelectorAll('[data-series-jump]').length===3 && document.getElementById('seriesNavigator').textContent.includes('Other Series') && document.getElementById('seriesNavigator').textContent.includes('75%') && document.getElementById('seriesNavigator').textContent.includes('Zeta <Series>')"), 'series navigator groups shows and includes partial progress in the overall percentage');
   check(await js("[...document.querySelectorAll('.progress-number')].map(e=>e.textContent).includes('50.0%') && [...document.querySelectorAll('.progress-number')].map(e=>e.textContent).includes('100%')"), 'episode progress bars display visible partial and completed percentages');
+  check(await js("document.querySelector('.nav-active').textContent==='Find active download' && !document.querySelector('.nav-active').disabled && document.querySelector('.nav-active-status').textContent.includes('3 active downloads')"), 'active-download navigation counts only active transfers, excluding resolving jobs');
+  backend.downloader.jobs.find(job=>job.id==='fixture:1:3').status='verifying';
+  await js('tick()');
+  check(await js("document.querySelector('.nav-active-status').textContent.includes('3 active downloads')"), 'active-download navigation excludes verifying jobs as well as source lookups');
+  const activeCycle=[
+    ['fixture:1:2','Active download 1 of 3: Fixture Show S01E02'],
+    ['fixture:1:5','Active download 2 of 3: Fixture Show S01E05'],
+    ['other:1:2','Active download 3 of 3: Other Series S01E02'],
+    ['fixture:1:2','Active download 1 of 3: Fixture Show S01E02']
+  ];
+  for(const [id,status] of activeCycle){
+    await js("document.querySelector('.nav-active').click(); tick()");
+    const rowId='queue-job-'+encodeURIComponent(id);
+    await waitFor(()=>js("document.querySelector('.nav-active-status').textContent==="+JSON.stringify(status)+" && document.getElementById("+JSON.stringify(rowId)+").getBoundingClientRect().bottom>0 && document.getElementById("+JSON.stringify(rowId)+").getBoundingClientRect().top<innerHeight"),'Active-download cycle did not reach '+id);
+  }
+  const savedStatuses=backend.downloader.jobs.map(job=>[job.id,job.status]);
+  for(const job of backend.downloader.jobs)if(job.status==='downloading')job.status='paused';
+  const singleActive=backend.downloader.jobs.find(job=>job.id==='fixture:1:2');singleActive.status='downloading';
+  await js('tick()');
+  check(await js("!document.querySelector('.nav-active').disabled && document.querySelector('.nav-active-status').textContent.includes('1 of 1')"), 'active-download navigation handles a single active transfer');
+  await js("document.querySelector('.nav-active').click(); tick()");
+  await waitFor(()=>js("document.querySelector('.nav-active-status').textContent.includes('1 of 1: Fixture Show S01E02') && Math.abs(document.getElementById('queue-job-fixture%3A1%3A2').getBoundingClientRect().top)<=1"),'Single active download jump timeout');
+  singleActive.status='done';
+  await js('tick()');
+  await waitFor(()=>js("document.querySelector('.nav-active').disabled && document.querySelector('.nav-active-status').textContent==='No active downloads'"),'Active-download control did not clear after the last transfer stopped');
+  check(true, 'active-download navigation disables itself when transfers complete or pause');
+  for(const [id,status] of savedStatuses)backend.downloader.jobs.find(job=>job.id===id).status=status;
+  await js('tick()');
   await js("document.querySelector('.queue-position').dispatchEvent(new KeyboardEvent('keydown',{key:'Home',bubbles:true}))");
   const drag=await js("(()=>{const m=document.querySelector('.queue-position').getBoundingClientRect(),t=document.getElementById('seriesTrack').getBoundingClientRect();return {x:Math.round(m.left+m.width/2),y:Math.round(m.top+4),end:Math.round(t.bottom-4),before:scrollY}})()");
   window.webContents.sendInputEvent({type:'mouseDown',x:drag.x,y:drag.y,button:'left',clickCount:1});
@@ -214,7 +248,7 @@ app.whenReady().then(async () => {
   await new Promise(resolve => setTimeout(resolve, 100));
   check(await js("document.querySelector('.queue-position').getAttribute('aria-valuenow')==='100' && document.querySelector('[data-series-jump=queue-series-2]').getAttribute('aria-current')==='location'"), 'navigator marker and current series follow the scroll position');
   await js("document.querySelector('[data-series-jump=queue-series-0]').click()");
-  await waitFor(()=>js("document.getElementById('queue-series-0').getBoundingClientRect().top<100"),'Series jump timeout');
+  await waitFor(()=>js("Math.abs(document.getElementById('queue-series-0-heading').getBoundingClientRect().top)<=1"),'Series jump did not align to its heading');
   const beforeScroll=await js('scrollY');await js('tick()');
   check(Math.abs((await js('scrollY'))-beforeScroll)<4, 'queue refresh preserves the current reading position');
   await new Promise(resolve => setTimeout(resolve, 100));
@@ -230,6 +264,29 @@ app.whenReady().then(async () => {
   await new Promise(resolve => setTimeout(resolve, 100));
   check(await js("document.getElementById('t').scrollWidth<=document.getElementById('t').clientWidth"), 'narrow queue shows recovery information without horizontal scrolling');
   fs.writeFileSync('test/recovery-queue-narrow.png', (await window.webContents.capturePage()).toPNG());
+
+  const longSeries=['Black Clover','Dog Whisperer',"Hell's Kitchen",'Lanterns','The Twilight Zone'].sort((a,b)=>a.localeCompare(b));
+  backend.downloader.jobs=longSeries.flatMap((series,index)=>Array.from({length:45},(_,episode)=>({id:'long:'+index+':'+episode,series:'long-'+index,seriesName:series,season:1,episode:episode+1,status:episode===0?'downloading':'queued',progress:episode===0?.1:0,speed:0})));
+  await js('tick()');
+  check(await js("document.querySelectorAll('[data-series-jump]').length===5"), 'long queue renders every series as a distinct navigator target');
+  await js("window.scrollTo({top:document.documentElement.scrollHeight,behavior:'auto'})");
+  for(let index=0;index<longSeries.length;index++){
+    const rowId='queue-series-'+index+'-heading';
+    if(index===0){
+      backend.downloader.jobs.find(job=>job.id==='long:0:0').stage='Refresh sentinel';
+      const refreshed=backend.downloader.jobs.map(job=>({...job}));
+      await js("document.querySelector('[data-series-jump=queue-series-0]').click(); window.renderQueue("+JSON.stringify(refreshed)+')');
+      check(!(await js("document.getElementById('t').textContent.includes('Refresh sentinel')")), 'queue refresh is deferred while a long series jump is in progress');
+      await waitFor(()=>js("Math.abs(document.getElementById("+JSON.stringify(rowId)+").getBoundingClientRect().top)<=1 && document.getElementById('t').textContent.includes('Refresh sentinel')"),'Series jump did not settle with its deferred refresh');
+    }else{
+      await js("document.querySelector('[data-series-jump=queue-series-"+index+"]').click(); tick()");
+      await waitFor(()=>js("Math.abs(document.getElementById("+JSON.stringify(rowId)+").getBoundingClientRect().top)<=1"),'Series jump failed for '+longSeries[index]);
+    }
+    check(await js("document.getElementById("+JSON.stringify(rowId)+").textContent.startsWith("+JSON.stringify(longSeries[index])+')'), 'series navigation reaches '+longSeries[index]+' even across a queue refresh');
+  }
+  await js("document.querySelector('[data-series-jump=queue-series-0]').click(); document.dispatchEvent(new WheelEvent('wheel',{deltaY:120,bubbles:true})); window.scrollBy(0,120); tick()");
+  const manualScroll=await js('scrollY');await js('tick()');
+  check(Math.abs((await js('scrollY'))-manualScroll)<4, 'manual scrolling cancels a pending series jump and survives queue refresh');
   console.log('Selection UI checks complete');
   app.exit(0);
 }).catch(error => {

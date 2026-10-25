@@ -24,13 +24,13 @@ async function getJson(url, signal, timeoutMs = 30000) {
 export class ProviderRequestPool {
   constructor(limit=32,{perOriginLimit=2,originSpacingMs=750,now=Date.now}={}){
     this.limit=limit;this.perOriginLimit=perOriginLimit;this.originSpacingMs=originSpacingMs;this.now=now;
-    this.active=0;this.waiters=[];this.activeByOrigin=new Map();this.lastStartByOrigin=new Map();this.drainTimer=null;
+    this.active=0;this.waiters=[];this.activeByOrigin=new Map();this.lastStartByOrigin=new Map();this.drainTimer=null;this.completedRequests=0;this.cancelledRequests=0;
   }
   acquire(signal,originId=''){
     signal?.throwIfAborted();
     return new Promise((resolve,reject)=>{
-      const item={signal,originId,resolve,reject};
-      item.abort=()=>{this.waiters=this.waiters.filter(waiter=>waiter!==item);reject(signal.reason||new Error('Provider lookup cancelled'));this.drain();};
+      const item={signal,originId,resolve,reject,queuedAt:this.now()};
+      item.abort=()=>{this.waiters=this.waiters.filter(waiter=>waiter!==item);this.cancelledRequests++;reject(signal.reason||new Error('Provider lookup cancelled'));this.drain();};
       signal?.addEventListener('abort',item.abort,{once:true});
       this.waiters.push(item);this.drain();
     });
@@ -55,10 +55,11 @@ export class ProviderRequestPool {
       const item=this.waiters.splice(selected,1)[0];item.signal?.removeEventListener('abort',item.abort);
       this.active++;if(item.originId){this.activeByOrigin.set(item.originId,(this.activeByOrigin.get(item.originId)||0)+1);this.lastStartByOrigin.set(item.originId,this.now());}
       let released=false;
-      item.resolve(()=>{if(released)return;released=true;this.active--;if(item.originId){const active=(this.activeByOrigin.get(item.originId)||1)-1;if(active)this.activeByOrigin.set(item.originId,active);else this.activeByOrigin.delete(item.originId);}this.drain();});
+      item.resolve(()=>{if(released)return;released=true;this.active--;if(item.signal?.aborted)this.cancelledRequests++;else this.completedRequests++;if(item.originId){const active=(this.activeByOrigin.get(item.originId)||1)-1;if(active)this.activeByOrigin.set(item.originId,active);else this.activeByOrigin.delete(item.originId);}this.drain();});
     }
   }
   snapshot(){return {active:this.active,waiting:this.waiters.length,limit:this.limit};}
+  health(){return {...this.snapshot(),oldestWaitMs:this.waiters.length?Math.max(0,this.now()-Math.min(...this.waiters.map(item=>item.queuedAt))):0,completed:this.completedRequests,cancelled:this.cancelledRequests};}
 }
 
 export const providerRequestPool=new ProviderRequestPool(32);
@@ -181,7 +182,7 @@ export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{
   const providers=allProviders.filter(provider=>(Number(providerHistory?.[provider.id]?.cooldownUntil)||0)<=nowFn()&&(Number(providerHistory?.[provider.originId]?.cooldownUntil)||0)<=nowFn())
     .sort((a,b)=>providerPriority(b,providerHistory,nowFn())-providerPriority(a,providerHistory,nowFn()));
   const collected=[],diagnostics=[],changeListeners=new Set();let cursor=0,completed=0,dynamicSuppressed=0,done=false;
-  const snapshot=()=>({streams:mergeStreams(collected),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length-dynamicSuppressed,suppressedCount:allProviders.length-providers.length+dynamicSuppressed,elapsedMs:Math.max(0,nowFn()-started),done});
+  const snapshot=()=>{const streams=mergeStreams(collected);const supported=collected.filter(({stream})=>/^[a-f0-9]{40}$/i.test(stream.infoHash||'')||/^https?:\/\//i.test(stream.url||'')).length;return {streams,rawCount:collected.length,unsupportedCount:collected.length-supported,duplicateCount:supported-streams.length,pool:pool.health?.()||pool.snapshot?.(),diagnostics:diagnostics.map(item=>({...item})),completed,providerCount:providers.length-dynamicSuppressed,suppressedCount:allProviders.length-providers.length+dynamicSuppressed,elapsedMs:Math.max(0,nowFn()-started),done};};
   const publish=()=>{try{onUpdate(snapshot());}catch{}for(const listener of [...changeListeners])listener();};
   const started=nowFn();
   const worker=async()=>{
@@ -192,9 +193,10 @@ export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{
       }
       let release=null,resultCount=0,status='network_error',category='network_error',latencyMs=0,retryAfterMs=0,requestStarted=0;
       try{
+      try{
         release=await pool.acquire(signal,provider.originId);
         if((Number(providerHistory?.[provider.id]?.cooldownUntil)||0)>nowFn()||(Number(providerHistory?.[provider.originId]?.cooldownUntil)||0)>nowFn()){
-          release();release=null;dynamicSuppressed++;publish();continue;
+          dynamicSuppressed++;publish();continue;
         }
         requestStarted=nowFn();
         const timeout=AbortSignal.timeout(timeoutMs);
@@ -212,13 +214,15 @@ export function createStreamLookup(epId,{signal,onUpdate=()=>{},onProvider=()=>{
         if(signal?.aborted)break;
         if(error?.name==='TimeoutError'||error?.name==='AbortError'||error?.cause?.name==='TimeoutError'){status='timeout';category='timeout';}
         else if(error?.providerCategory){status='http_error';category=error.providerCategory;}
+        else if(error instanceof SyntaxError){status='invalid_response';category='invalid_response';}
         else if(status!=='invalid_response'){status='network_error';category='network_error';}
       }finally{latencyMs=requestStarted?Math.max(0,nowFn()-requestStarted):0;}
-      if(signal?.aborted){release?.();break;}
+      if(signal?.aborted)break;
       const result={providerId:provider.id,originId:provider.originId,status,category,latencyMs,resultCount,retryAfterMs};
       diagnostics.push(result);completed++;
-      try{onProvider({...result});}catch{}finally{release?.();release=null;}
+      try{onProvider({...result});}catch{}
       publish();
+      }finally{release?.();}
     }
   };
   const promise=(async()=>{

@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.4.17
+
+- Always release provider request leases when lookups are cancelled.
+- Expose request-pool health and source-selection rejection counts.
+- Clear stale retry feedback and distinguish blocked providers from unavailable episodes.
+
+## 0.4.16
+
+- Limit simultaneous provider requests per service origin and stagger requests to prevent queued episodes from flooding shared add-on hosts.
+- Apply a shared, expiring host cooldown after HTTP 429 responses; honor `Retry-After` and retain endpoint-specific cooldowns.
+- Treat the English audio checkbox as a preference, allowing another listed release when no English-labeled one is available.
+- Report an empty compatible-source result accurately instead of labeling an empty provider response as a missing English dub.
+
+## 0.4.15
+
+- Yield slow transfers to due deferred retries as well as fresh work; resume yielded episodes in order after higher-priority work drains, preserving their partial files and manual pauses.
+- Back off Stremio add-ons that repeatedly fail: 30 minutes for persistent client errors and 5 minutes with exponential growth up to 30 minutes for timeouts, network errors, and server errors. Successful or empty responses clear provider backoff; expired providers are retried.
+- Record typed source-test outcomes and expose privacy-safe hourly diagnostic summaries retained for 14 days through `/api/diagnostics/sources`.
+- After finalizing a torrent download, compare SHA-256 fingerprints of the staged source and final file; remove only that verified staged file after all active references to its torrent have ended.
+
+## 0.4.14
+
+- Start source-turn timing before Stremio add-on lookup and feed provider results into episode source selection as they arrive.
+- Share add-on requests fairly across queued jobs with a global limit of 32 in flight and no more than eight per episode.
+- Rank providers using recent response latency and verified download throughput; short-lived provider cooldowns only affect ordering.
+- Record rotating, privacy-safe source diagnostics with opaque provider and release identifiers, response categories, latency, result count, and verified transfer rates.
+- Retry up to four due deferred episodes in available normal slots after queued work drains, rotating fairly across shows while keeping fresh work first.
+- Recover the requested episode by a unique filename or episode tag when a provider's torrent file index points at another episode; reject ambiguous matches.
+- Expose concise add-on lookup progress in the queue and preserve existing request formats, source limits, quality rules, and media verification.
+
+## 0.4.13
+
+- Search up to five distinct releases, including the initial source, within a 60-second no-data turn; retain the 15-second metadata timeout, two-test budget, 30-second candidate cap, and 16 MiB test cap.
+- Test requested-quality releases before explicitly permitted lower-quality fallbacks, and count only verified torrent episode bytes or valid HTTP video payload as useful connectivity.
+- Rank otherwise eligible releases using short-lived throughput from verified downloads and source comparisons; keep torrent history keyed by swarm and HTTP history keyed by a hashed hostname.
+- Show source-turn progress, candidate rates, and remaining search time in the queue while preserving retry behavior, partial downloads, and quality/audio restrictions.
+
+## 0.4.12
+
+- Increase the built-in normal download concurrency from two to four while retaining a shared budget of two extra network activities.
+- Fail over on torrent metadata timeouts after 15 seconds; compare other eligible sources after 15 seconds without useful episode data and resolve no-data attempts within 45 seconds.
+- Keep candidate limits, verified episode-data checks, source quality/audio restrictions, and the clear-win switching threshold.
+- Try no more than three distinct sources in one scheduling turn and keep later ready episodes moving when sources are unavailable.
+- Replace terminal source failures with persisted deferred retries after the existing 5, 15, and 60-minute cycle: 30 minutes, one hour, then every two hours.
+- Run at most one deferred retry at a time and only after fresh queued work drains; migrate source-related Needs attention jobs into this retry path.
+- Show source wait, metadata wait, comparison progress, and deferred retry timing in queue feedback and job responses.
+
+## 0.4.11
+
+- Track rolling 30-second episode rates and compare sources after 60 seconds of sustained slow progress.
+- Keep the current transfer running while testing up to two eligible alternatives; choose a replacement only when verified episode data is at least 2x faster and 0.25 MiB/s faster.
+- Remove the artificial candidate speed ceiling while retaining payload, time, setup, quality, fallback, and shared-activity limits.
+- Yield slow jobs behind ready queue work without discarding source-specific partials, then resume them fairly when capacity opens.
+- Show rolling rates, source-comparison progress, candidate rates, and when an episode waits behind other downloads.
+- Store expiring source-speed history under opaque identifiers and mark a source slow only after a confirmed speed comparison.
+
 ## 0.4.10
 
 - Compare up to two distinct sources after 30 seconds without useful episode data, while the original keeps running.
@@ -45,53 +101,3 @@ Local builds preceded this repository; there is no reconstructed historical Git 
 - Queue controls, individual removal, remove-all, and persisted state.
 - Torrent metadata caching, tracker fallbacks, source fallback, retained partial pieces, and resumable HTTP transfers.
 - Windows installer and tray application.
-
-## 0.4.11
-
-- Track rolling 30-second episode rates and compare sources after 60 seconds of sustained slow progress.
-- Keep the current transfer running while testing up to two eligible alternatives; choose a replacement only when verified episode data is at least 2x faster and 0.25 MiB/s faster.
-- Remove the artificial candidate speed ceiling while retaining payload, time, setup, quality, fallback, and shared-activity limits.
-- Yield slow jobs behind ready queue work without discarding source-specific partials, then resume them fairly when capacity opens.
-- Show rolling rates, source-comparison progress, candidate rates, and when an episode waits behind other downloads.
-- Store expiring source-speed history under opaque identifiers and mark a source slow only after a confirmed speed comparison.
-
-## 0.4.12
-
-- Increase the built-in normal download concurrency from two to four while retaining a shared budget of two extra network activities.
-- Fail over on torrent metadata timeouts after 15 seconds; compare other eligible sources after 15 seconds without useful episode data and resolve no-data attempts within 45 seconds.
-- Keep candidate limits, verified episode-data checks, source quality/audio restrictions, and the clear-win switching threshold.
-- Try no more than three distinct sources in one scheduling turn and keep later ready episodes moving when sources are unavailable.
-- Replace terminal source failures with persisted deferred retries after the existing 5, 15, and 60-minute cycle: 30 minutes, one hour, then every two hours.
-- Run at most one deferred retry at a time and only after fresh queued work drains; migrate source-related Needs attention jobs into this retry path.
-- Show source wait, metadata wait, comparison progress, and deferred retry timing in queue feedback and job responses.
-
-## 0.4.13
-
-- Search up to five distinct releases, including the initial source, within a 60-second no-data turn; retain the 15-second metadata timeout, two-test budget, 30-second candidate cap, and 16 MiB test cap.
-- Test requested-quality releases before explicitly permitted lower-quality fallbacks, and count only verified torrent episode bytes or valid HTTP video payload as useful connectivity.
-- Rank otherwise eligible releases using short-lived throughput from verified downloads and source comparisons; keep torrent history keyed by swarm and HTTP history keyed by a hashed hostname.
-- Show source-turn progress, candidate rates, and remaining search time in the queue while preserving retry behavior, partial downloads, and quality/audio restrictions.
-
-## 0.4.14
-
-- Start source-turn timing before Stremio add-on lookup and feed provider results into episode source selection as they arrive.
-- Share add-on requests fairly across queued jobs with a global limit of 32 in flight and no more than eight per episode.
-- Rank providers using recent response latency and verified download throughput; short-lived provider cooldowns only affect ordering.
-- Record rotating, privacy-safe source diagnostics with opaque provider and release identifiers, response categories, latency, result count, and verified transfer rates.
-- Retry up to four due deferred episodes in available normal slots after queued work drains, rotating fairly across shows while keeping fresh work first.
-- Recover the requested episode by a unique filename or episode tag when a provider's torrent file index points at another episode; reject ambiguous matches.
-- Expose concise add-on lookup progress in the queue and preserve existing request formats, source limits, quality rules, and media verification.
-
-## 0.4.15
-
-- Yield slow transfers to due deferred retries as well as fresh work; resume yielded episodes in order after higher-priority work drains, preserving their partial files and manual pauses.
-- Back off Stremio add-ons that repeatedly fail: 30 minutes for persistent client errors and 5 minutes with exponential growth up to 30 minutes for timeouts, network errors, and server errors. Successful or empty responses clear provider backoff; expired providers are retried.
-- Record typed source-test outcomes and expose privacy-safe hourly diagnostic summaries retained for 14 days through `/api/diagnostics/sources`.
-- After finalizing a torrent download, compare SHA-256 fingerprints of the staged source and final file; remove only that verified staged file after all active references to its torrent have ended.
-
-## 0.4.16
-
-- Limit simultaneous provider requests per service origin and stagger requests to prevent queued episodes from flooding shared add-on hosts.
-- Apply a shared, expiring host cooldown after HTTP 429 responses; honor `Retry-After` and retain endpoint-specific cooldowns.
-- Treat the English audio checkbox as a preference, allowing another listed release when no English-labeled one is available.
-- Report an empty compatible-source result accurately instead of labeling an empty provider response as a missing English dub.

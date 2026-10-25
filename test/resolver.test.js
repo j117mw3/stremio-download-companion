@@ -29,6 +29,8 @@ assert.equal(best.res, 2160);
 assert.equal(pickBest([streams[0], streams[3]], { mode: 'require' }), null);
 const unmarked = mk('720p', 'Show.S01E01.720p.WEB-DL');
 assert.equal(pickBest([unmarked], { mode: 'require' }).raw, unmarked);
+const knownForeign = mk('720p', 'Show.S01E01.720p.GERMAN');
+assert.equal(pickBest([knownForeign], { mode: 'prefer' }).raw, knownForeign, 'audio preference must not block the only eligible source');
 
 // max resolution cap
 best = pickBest(streams, { mode: 'off', maxResolution: 1080 });

@@ -2,9 +2,9 @@
   "port": 7000,
   "downloadDir": "./downloads",
   "torrentioUrl": "https://torrentio.strem.fun",
-  "concurrency": 2,
+  "concurrency": 4,
   "dubMode": "auto",
   "maxResolution": 0,
   "stallMinutes": 5,
-  "metadataTimeoutSeconds": 30
+  "metadataTimeoutSeconds": 15
 }

@@ -6,7 +6,7 @@ import express from 'express';
 import { randomBytes, createHash } from 'node:crypto';
 import { cfg } from './config.js';
 import { Downloader } from './downloader.js';
-import { parseId, getEpisodes, getStreams, parseStream } from './resolver.js';
+import { parseId, getEpisodes, getStreams, parseStream, providerRequestPool } from './resolver.js';
 
 const app = express();
 const version = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -58,7 +58,7 @@ app.get('/selection.js',(req,res)=>res.type('text/javascript').sendFile(fileURLT
 app.post('/api/preview',async(req,res)=>{try{const data=await showData(req.body?.id);const episodes=selectEpisodes(data.episodes,req.body);if(!episodes.length)return res.status(400).json({error:'No released episodes selected'});const previewToken=randomBytes(24).toString('hex');for(const [key,value]of previews)if(value.expires<Date.now())previews.delete(key);previews.set(previewToken,{data,episodes,expires:Date.now()+300000});res.json({previewToken,count:episodes.length,episodes});}catch(e){res.status(400).json({error:e.message})}});
 app.post('/api/queue',(req,res)=>{if(dl.clearing)return res.status(409).json({error:'The queue is being cleared; try again shortly'});const{previewToken,resolution,fallbacks=[],english}=req.body;const preview=previews.get(previewToken);if(!preview||preview.expires<Date.now())return res.status(400).json({error:'Selection expired; please try again'});if(![480,720,1080,1440,2160].includes(resolution)||!Array.isArray(fallbacks)||fallbacks.some(n=>![480,720,1080,1440,2160].includes(n)||n>=resolution))return res.sendStatus(400);const{data,episodes}=preview;const added=dl.enqueue({kind:data.parsed.kind,series:data.parsed.series,seriesName:data.name,episodes,profile:{resolution,allowedResolutions:[resolution,...fallbacks],english:!!english||data.anime}});previews.delete(previewToken);res.json({added});});
 app.get('/api/sources',async(req,res)=>{try{const job=dl.jobs.find(j=>j.id===req.query.id);if(!job)return res.sendStatus(404);const streams=await getStreams(job.id,{providerHistory:dl.providerResults});res.json({sources:streams.map(raw=>{const source=parseStream(raw);return {key:createHash('sha256').update(JSON.stringify([raw.infoHash,raw.fileIdx,raw.url])).digest('hex'),title:source.title,providers:source.addonNames,connectivity:dl.sourceResult(source),resolution:source.res,english:source.dub,seeders:source.seeders}})});}catch{res.status(502).json({error:'Sources could not load'})}});
-app.get('/api/diagnostics/sources',(req,res)=>res.json({records:dl.getSourceDiagnostics(Number(req.query.limit)||100),hourly:dl.getSourceDiagnosticSummary()}));
+app.get('/api/diagnostics/sources',(req,res)=>res.json({pool:providerRequestPool.health(),records:dl.getSourceDiagnostics(Number(req.query.limit)||100),hourly:dl.getSourceDiagnosticSummary()}));
 app.post('/api/source',(req,res)=>{try{const job=dl.jobs.find(j=>j.id===req.body.id);if(!job||!/^[a-f0-9]{64}$/.test(req.body.key))return res.sendStatus(400);if(dl.controllers.has(job.id))return res.status(409).json({error:'Pause the job before choosing a source'});job.sourceOverride=req.body.key;dl.control(job.id,'retry');res.json({ok:true})}catch{res.sendStatus(400)}});
 app.post('/api/control',(req,res)=>{try{dl.control(req.body.id,req.body.action);res.json({ok:true})}catch(e){res.status(dl.clearing?409:400).json({error:e.message})}});
 app.delete('/api/jobs',async(req,res)=>{try{res.json({removed:await dl.clearAll()})}catch(e){res.status(409).json({error:e.message})}});

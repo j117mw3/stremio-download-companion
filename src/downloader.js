@@ -416,6 +416,7 @@ export class Downloader {
     let lookupController=null,lookupPromise=null,lookupDeadlineTimer=null;
     try {
       job.status = 'resolving';
+      job.sourceDiscovery=null;job.sourceSearch=null;job.comparison=null;job.fallbackReason=null;job.switchNote=null;job.sourceWaitStartedAt=null;job.metadataWaitStartedAt=null;
       job.runStartedAt=this.now();job.lastProgressAt=null;job.idleSeconds=0;
       job.error = null;job.failureCode=null;job.speed=0;job.rollingSpeed=0;job.slowSince=null;job.recoveredSince=null;job.torrentSpeed=0;job.nextRetryAt=null;
       job.reused=false;job.replacement=null;
@@ -472,6 +473,11 @@ export class Downloader {
           timeouts:records.filter(record=>record.status==='timeout').length,
           errors:records.filter(record=>!['ok','empty','timeout'].includes(record.status)).length,
           releases:streams.length,
+          rawCount:Number(snapshot?.rawCount)||0,unsupportedCount:Number(snapshot?.unsupportedCount)||0,duplicateCount:Number(snapshot?.duplicateCount)||0,
+          qualityRejected:streams.filter(raw=>!pickBest([raw],{...choiceOptions,mode:'off'})).length,
+          audioRejected:streams.filter(raw=>pickBest([raw],{...choiceOptions,mode:'off'})&&!pickBest([raw],choiceOptions)).length,
+          cooldownRejected:streams.filter(raw=>!this.available(job,parseStream(raw))).length,
+          pool:snapshot?.pool||null,
         };
         if(snapshot?.done)lookupComplete=true;
         this.save();wakeFeed();
@@ -510,9 +516,9 @@ export class Downloader {
       if(!choice){
         const originalCount=streams.length;
         if(lookupError&&!originalCount)throw failure('PROVIDER_FAILURE','Provider lookup did not return a usable response');
-        const sourceCooldown=originalCount&&!availableStreams().length;
+        const sourceCooldown=originalCount&&!availableStreams().length||!originalCount&&job.sourceDiscovery?.suppressedCount>0;
         const onlyAudioMismatch=mode==='require'&&originalCount>0&&!!pickBest(streams,{...choiceOptions,mode:'off'})&&!pickBest(streams,choiceOptions);
-        throw failure(sourceCooldown?'SOURCE_COOLDOWN':'NO_SOURCES',sourceCooldown?'Sources are cooling down':onlyAudioMismatch?'No English-audio source was listed':'No compatible episode sources were returned');
+        throw failure(sourceCooldown?'SOURCE_COOLDOWN':'NO_SOURCES',sourceCooldown?'Source providers are cooling down; lookup did not establish episode availability':job.sourceDiscovery?.unsupportedCount>0?'Add-ons returned external or unsupported links, but no downloadable episode source':onlyAudioMismatch?'No English-audio source was listed':'No compatible episode sources were returned');
       }
 
       job.quality = choice.res ? `${choice.res}p` : '?';
@@ -922,7 +928,7 @@ export class Downloader {
     if (this.clearing) throw new Error('The queue is being cleared; try again shortly');
     const job=this.jobs.find(j=>j.id===id);if(!job) throw new Error("Unknown job");
     if(action==="pause"||action==="cancel"){if(job.status==="done")throw new Error("Completed downloads cannot be paused or cancelled");job.status=action==="pause"?"paused":"cancelled";job.backgroundRetryActive=false;job.yieldedAt=null;job.nextRetryAt=null;job.speed=0;job.torrentSpeed=0;this.controllers.get(id)?.abort();}
-    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done"){job.status="queued";job.backgroundRetryActive=false;job.yieldedAt=null;job.queueOrder=this.nextQueueOrder();job.retryRound=0;job.deferredRetryRound=0;job.nextRetryAt=null;job.failureCode=null;job.recentSources=[];for(const key of Object.keys(this.cooldowns||{}))if(key.startsWith(job.id+'|'))delete this.cooldowns[key];}}
+    else if(action==="resume"||action==="retry"){if(this.controllers.has(id)) throw new Error("Transfer is stopping; retry shortly");if(job.status!=="done"){job.status="queued";job.error=null;job.sourceDiscovery=null;job.sourceSearch=null;job.comparison=null;job.fallbackReason=null;job.switchNote=null;job.backgroundRetryActive=false;job.yieldedAt=null;job.queueOrder=this.nextQueueOrder();job.retryRound=0;job.deferredRetryRound=0;job.nextRetryAt=null;job.failureCode=null;job.recentSources=[];for(const key of Object.keys(this.cooldowns||{}))if(key.startsWith(job.id+'|'))delete this.cooldowns[key];}}
     else throw new Error("Unknown action");
     this.save();this.pump();
   }
